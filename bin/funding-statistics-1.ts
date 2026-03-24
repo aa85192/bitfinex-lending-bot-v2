@@ -18,7 +18,10 @@ import { dayjs } from '../lib/dayjs.mjs'
 import { floatFormatDecimal } from '../lib/helper.mjs'
 import { createLoggersByUrl } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
+import * as bitfinexLib from '../lib/bitfinex.mjs'
 import Papa from 'papaparse'
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000
 
 const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
@@ -41,7 +44,7 @@ const ZodConfig = z.object({
 export async function main (): Promise<void> {
   const cfg = ZodConfig.parse({
     currencys: getenv('INPUT_CURRENCYS', '')?.split(','),
-    db: getenv('INPUT_DB', `https://aa85192.github.io/bitfinex-lending-bot/${filename}/db.json`),
+    db: getenv('INPUT_DB', `https://aa85192.github.io/bitfinex-lending-bot-v2/${filename}/db.json`),
   })
   ymlDump('input', cfg)
   if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
@@ -58,6 +61,8 @@ export async function main (): Promise<void> {
   ymlDump('db', db)
 
   for (const currency of cfg.currencys) {
+    const utilizationByDate = await calcUtilizationByDate(currency)
+
     let payments = await bitfinex.v2AuthReadLedgersHist({
       category: LedgersHistCategory.MarginSwapInterestPayment,
       currency,
@@ -69,11 +74,11 @@ export async function main (): Promise<void> {
 
     const stats: Record<string, any> = {}
     let [dateMax, dateMin]: any[] = [null, null]
-    const tplStat = date => ({ date, interest: 0, balance: null, investment: null, dpr: 0, apr1: 0, apr7: 0, apr30: 0, apr365: 0 })
+    const tplStat = date => ({ date, interest: 0, balance: null, investment: null, utilization: 0, dpr: 0, apr1: 0, apr7: 0, apr30: 0, apr365: 0 })
     for (const payment of payments) {
       const date1 = dayjs(payment.mts).format('YYYY-MM-DD')
-      dateMax = _.isNil(dateMax) || date1 > dateMax ? date1 : dateMax
-      dateMin = _.isNil(dateMin) || date1 < dateMin ? date1 : dateMin
+      dateMax = _.max([dateMax ?? date1, date1])
+      dateMin = _.min([dateMin ?? date1, date1])
 
       const stat = stats[date1] ??= tplStat(date1)
       stat.balance = Math.max(stat.balance ?? 0, payment.balance)
@@ -98,6 +103,8 @@ export async function main (): Promise<void> {
       stat.investment ??= prevBalance
       stat.balance ??= prevBalance
       prevBalance = stat.balance
+      const utilizedAmountByDay = utilizationByDate[date2] ?? 0
+      stat.utilization = stat.investment <= 0 ? 0 : _.round(100 * utilizedAmountByDay / stat.investment, 8)
       stat.apr7 /= 7
       stat.apr30 /= 30
       stat.apr365 /= 365
@@ -114,6 +121,7 @@ export async function main (): Promise<void> {
 \`
 日期: ${dateMax.replaceAll('-', '\\-')}
 利息: ${floatFormatDecimal(stat2.interest, 8)} ${currency}
+使用率: ${floatFormatDecimal(stat2.utilization, 2)}%
   1日年化: ${floatFormatDecimal(stat2.apr1, 2)}%
   7日年化: ${floatFormatDecimal(stat2.apr7, 2)}%
  30日年化: ${floatFormatDecimal(stat2.apr30, 2)}%
@@ -139,12 +147,55 @@ export async function main (): Promise<void> {
   )
 }
 
+async function calcUtilizationByDate (currency: string): Promise<Record<string, number>> {
+  try {
+    // hist: last 3 days of closed credits; active: currently open credits (use now as closedAt)
+    const [histCredits, activeCredits] = await Promise.all([
+      bitfinexLib.getFundingCreditsHist({ currency, limit: 500 }),
+      bitfinexLib.getFundingCredits({ currency }),
+    ])
+    const now = Date.now()
+    const credits = [
+      ...histCredits,
+      ...activeCredits.map(c => ({ ...c, mtsUpdate: new Date(now) })),
+    ]
+    const results: Record<string, number> = {}
+
+    for (const credit of credits) {
+      if (credit.side !== 1) continue // only lend side
+      const amount = Math.abs(credit.amount)
+      if (amount <= 0) continue
+
+      const openedAt = dayjs(credit.mtsOpening)
+      const closedAt = dayjs(credit.mtsUpdate)
+      if (!openedAt.isValid() || !closedAt.isValid() || !closedAt.isAfter(openedAt)) continue
+
+      for (let dayStart = openedAt.startOf('day'); dayStart.isBefore(closedAt); dayStart = dayStart.add(1, 'day')) {
+        const dayEnd = dayStart.add(1, 'day')
+        const overlapStart = Math.max(dayStart.valueOf(), openedAt.valueOf())
+        const overlapEnd = Math.min(dayEnd.valueOf(), closedAt.valueOf())
+        if (overlapEnd <= overlapStart) continue
+
+        const date = dayStart.format('YYYY-MM-DD')
+        const amountByDay = amount * (overlapEnd - overlapStart) / MS_PER_DAY
+        results[date] = _.round((results[date] ?? 0) + amountByDay, 8)
+      }
+    }
+
+    return results
+  } catch (err) {
+    loggers.error(inspect(err))
+    return {}
+  }
+}
+
 async function writeFile (filepath: URL, data: string): Promise<void> {
   try {
     await fsPromises.mkdir(new URL('.', filepath), { recursive: true })
     await fsPromises.writeFile(filepath, data)
   } catch (err) {
     _.set(err, 'data.writeFile', { filepath, data })
+    throw err
   }
 }
 

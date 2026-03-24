@@ -10,15 +10,15 @@ on:
 env:
   BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
   BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
-  TELEGRAM_CHAT_ID: '-4119951617'
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
   TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
 
 jobs:
   bitfinex:
     # 避免被 fork 的 repository 觸發，請改成自己的 GitHub 帳號
-    if: github.repository_owner == 'taichunmin'
+    if: github.repository_owner == 'aa85192'
     # 這個名字必須跟 repo 的 Environments 名稱一樣
-    environment: taichunmin-usdt-1
+    environment: aa85192
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

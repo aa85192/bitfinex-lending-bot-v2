@@ -2,8 +2,8 @@
   "author": "taichunmin <taichunmin@gmail.com>",
   "license": "MIT",
   "main": "index.js",
-  "name": "bitfinex-lending-bot",
-  "repository": "git@github.com:taichunmin/bitfinex-lending-bot.git",
+  "name": "bitfinex-lending-bot-v2",
+  "repository": "git@github.com:aa85192/bitfinex-lending-bot-v2.git",
   "type": "module",
   "version": "0.1.0",
   "dependencies": {
