@@ -17,7 +17,7 @@ import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
 import { dayjs } from '../lib/dayjs.mjs'
-import { dateStringify, floatFormatDecimal, floatIsEqual, rateStringify } from '../lib/helper.mjs'
+import { dateStringify, floatFormatDecimal, floatFormatPercent, floatIsEqual, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
 
@@ -29,6 +29,13 @@ const bitfinex = new Bitfinex({
   apiSecret: getenv('BITFINEX_API_SECRET'),
   affCode: getenv('BITFINEX_AFF_CODE'),
 })
+
+const ZodDb = z.object({
+  schema: z.literal(1),
+  msgId: z.number().int().nullish().catch(null),
+  balance: z.number().nullish().catch(null),
+  creditIds: z.array(z.number().int()).nullish().catch(null),
+}).catch({ schema: 1 })
 
 function ymlDump (key: string, val: any): void {
   loggers.log(_.set({}, key, val))
@@ -65,6 +72,11 @@ export async function main (): Promise<void> {
     rateMin: rateStringify(cfg.rateMin),
     rateMax: rateStringify(cfg.rateMax),
   })
+  const DB_KEY = `api:${filename}_${cfg.currency}`
+  const dbRaw = await bitfinex.v2AuthReadSettings([DB_KEY]).catch(() => ({}))
+  const db = ZodDb.parse(dbRaw[DB_KEY.slice(4)] ?? {})
+  ymlDump('db', db)
+
   if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
     loggers.error('Bitfinex API is in maintenance mode')
     return
@@ -188,29 +200,64 @@ export async function main (): Promise<void> {
 
   if (_.isMatchWith(autoFunding ?? {}, target, floatIsEqual)) {
     loggers.log('Setting of auto-renew no change.')
-    return
+  } else {
+    if (autoFunding) await bitfinex.v2AuthWriteFundingAuto({ ..._.pick(cfg, ['currency']), status: 0 })
+    await bitfinex.v2AuthWriteFundingOfferCancelAll(_.pick(cfg, ['currency']))
+    await bitfinex.v2AuthWriteFundingAuto({
+      ..._.pick(cfg, ['currency', 'amount']),
+      period: target.period,
+      rate: target.rate * 100, // percentage of rate
+      status: 1,
+    }).catch(err => { throw _.merge(err, { data: { target } }) })
   }
 
-  if (autoFunding) await bitfinex.v2AuthWriteFundingAuto({ ..._.pick(cfg, ['currency']), status: 0 })
-  await bitfinex.v2AuthWriteFundingOfferCancelAll(_.pick(cfg, ['currency']))
-  await bitfinex.v2AuthWriteFundingAuto({
-    ..._.pick(cfg, ['currency', 'amount']),
-    period: target.period,
-    rate: target.rate * 100, // percentage of rate
-    status: 1,
-  }).catch(err => { throw _.merge(err, { data: { target } }) })
-
-  // 取得掛單並計算掛單中的總金額
-  await scheduler.wait(1000) // 等待 1 秒鐘，讓掛單生效
+  // 等待掛單生效，取得最新狀態
+  await scheduler.wait(1000)
+  const wallets = _.keyBy(await bitfinex.v2AuthReadWallets(), w => `${w.type}:${w.currency}`)
+  const wallet = wallets[`funding:${cfg.currency}`] ?? { balance: 0 }
+  const credits = _.filter(await bitfinex.v2AuthReadFundingCredits({ currency: cfg.currency }), c => c.side === 1)
   const orders = await bitfinex.v2AuthReadFundingOffers({ currency: cfg.currency })
-  const orderAmount = floatFormatDecimal(_.sumBy(orders, 'amount') ?? 0, 8)
-  loggers.log({ orders, orderAmount })
+  const creditsAmountSum = _.sumBy(credits, 'amount') ?? 0
+  const ordersAmountSum = _.sumBy(orders, 'amount') ?? 0
+  const creditIds = _.sortBy(_.map(credits, 'id'))
+  loggers.log({ creditsAmountSum, ordersAmountSum, creditIds })
 
-  if (orderAmount !== '0.00000000') {
-    await telegram.sendMessage({
-      text: `${filename}:\n以 ${rateStringify(target.rate)} 利率自動借出 ${orderAmount} ${cfg.currency}，最多 ${target.period} 天`,
-    }).catch(loggers.error)
+  if (wallet.balance < Number.EPSILON) return
+
+  // 決定是否重用同一則訊息
+  let reuseMsgId = _.isNumber(db.msgId)
+  reuseMsgId &&= floatIsEqual(db.balance ?? 0, wallet.balance)
+  reuseMsgId &&= _.isEqual(db.creditIds ?? [], creditIds)
+
+  // 組成訊息
+  const pct = (part: number, total: number): string => total <= 0 ? '0.0%' : `${(100 * part / total).toFixed(1)}%`
+  const nowStr = dayjs().utcOffset(8).format('M/D HH:mm')
+  const creditLines = _.map(credits, c =>
+    `  ${floatFormatDecimal(c.amount, 3)} @ ${floatFormatPercent(c.rate, 6)} × ${c.period}天 (${dayjs(c.mtsOpening).utcOffset(8).format('M/D HH:mm')})`
+  ).join('\n')
+  const msgText = [
+    `${filename}: ${cfg.currency} 狀態\n`,
+    `投資額: ${floatFormatDecimal(wallet.balance, 3)}`,
+    `已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${pct(creditsAmountSum, wallet.balance)})`,
+    `掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${pct(ordersAmountSum, wallet.balance)})`,
+    `自動掛單設定:`,
+    `    利率: ${rateStringify(target.rate)}`,
+    `    天數: ${target.period}`,
+    `更新: ${nowStr} (UTC+8)`,
+    credits.length > 0 ? `\n出借中:\n${creditLines}` : '',
+  ].filter(Boolean).join('\n')
+
+  if (reuseMsgId) {
+    await telegram.editMessageText({ message_id: db.msgId, text: msgText }).catch(loggers.error)
+  } else {
+    const res = await telegram.sendMessage({ text: msgText }).catch(loggers.error)
+    if (res?.message_id) {
+      db.msgId = res.message_id
+      db.balance = wallet.balance
+      db.creditIds = creditIds
+    }
   }
+  await bitfinex.v2AuthWriteSettingsSet({ [DB_KEY]: ZodDb.parse(db) }).catch(loggers.error)
 }
 
 export function rateToPeriod (periodMap: z.output<typeof ZodConfig>['period'], rateTarget) {
