@@ -15,7 +15,7 @@ Bitfinex 自動放貸機器人，基於 [taichunmin/bitfinex-lending-bot](https:
 
 ---
 
-## Fork 後需要修改的地方
+## 需要修改的地方
 
 ### 1. `bin/funding-statistics-1.ts`
 
