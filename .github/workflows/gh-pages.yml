@@ -9,24 +9,16 @@ on:
     # 避開整點時間，因為有可能會有時間上的延誤
     - cron: '45 0-3 * * *'
 
-env:
-  BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
-  BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-  TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    environment: aa85192
+    env:
+      BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
+      BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
     steps:
       - name: Dump GitHub Context
         run: |
@@ -53,6 +45,19 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: './dist'
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
