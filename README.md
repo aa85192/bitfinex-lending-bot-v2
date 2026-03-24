@@ -1,27 +1,97 @@
-# bitfinex-lending-bot
+# bitfinex-lending-bot-v2
 
-## Related Links
+Bitfinex 自動放貸機器人，基於 [taichunmin/bitfinex-lending-bot](https://github.com/taichunmin/bitfinex-lending-bot) 修改而來。
 
+感謝戴均民前輩（[@taichunmin](https://github.com/taichunmin)）的原始專案與 [`@taichunmin/bitfinex`](https://github.com/taichunmin/js-bitfinex) SDK，本專案建立在他的工作成果之上。
+
+---
+
+## 功能
+
+- **自動調整放貸利率**：分析過去 24 小時的成交量分布，以二分搜尋法找出最佳利率
+- **自動設定天數**：依利率高低對應借出天數，利率越高借越久
+- **Telegram 通知**：每次執行更新同一則訊息，顯示目前狀態（投資額、已借出、掛單中、每筆明細）
+- **收益統計報表**：計算每日/七日/三十日年化報酬率，部署至 GitHub Pages，支援 Google Sheets 匯入
+
+---
+
+## Fork 後需要修改的地方
+
+### 1. `bin/funding-statistics-1.ts`
+
+第 47 行，將 `aa85192` 改為你的 GitHub 帳號：
+
+```ts
+db: getenv('INPUT_DB', `https://你的帳號.github.io/bitfinex-lending-bot-v2/funding-statistics-1/db.json`),
+```
+
+### 2. `.github/workflows/taichunmin-usd-1.yml`
+
+| 項目 | 說明 |
+|---|---|
+| `if: github.repository_owner == 'aa85192'` | 改為你的 GitHub 帳號，避免 fork 後誤觸發 |
+| `environment: aa85192` | 改為你自己建立的 Environment 名稱 |
+| `INPUT_CURRENCY` | 放貸幣種（`USD` 或 `UST`） |
+| `INPUT_RANK` | 目標成交量百分位，`0.8` = 取市場前 80% 的利率 |
+| `INPUT_RATE_MIN` | 最低可接受利率（日利率，`0.0001` = APR 3.65%） |
+| `INPUT_RATE_MAX` | 最高可接受利率（日利率，`0.01` = APR 365%） |
+| `INPUT_PERIOD` | 利率對應天數表（利率越高，借出越多天） |
+
+### 3. `.github/workflows/taichunmin-usdt-1.yml`
+
+同上，幣種改為 `UST`。
+
+### 4. `package.json`
+
+```json
+"repository": "git@github.com:你的帳號/bitfinex-lending-bot-v2.git"
+```
+
+---
+
+## GitHub 設定
+
+### Repository Secrets
+
+前往 `Settings → Secrets and variables → Actions → New repository secret`，新增以下四個：
+
+| Secret 名稱 | 說明 |
+|---|---|
+| `BITFINEX_API_KEY` | Bitfinex API Key（需開啟 Funding 讀寫權限） |
+| `BITFINEX_API_SECRET` | Bitfinex API Secret |
+| `TELEGRAM_TOKEN` | Telegram Bot Token（向 [@BotFather](https://t.me/BotFather) 申請） |
+| `TELEGRAM_CHAT_ID` | 你的 Telegram Chat ID |
+
+### Environments
+
+前往 `Settings → Environments → New environment`，建立與 workflow 中 `environment:` 相同名稱的環境（預設為 `aa85192`，改為你的帳號名稱）。
+
+### GitHub Pages
+
+前往 `Settings → Pages → Build and deployment`，將 Source 設為 **GitHub Actions**。
+
+---
+
+## Workflows
+
+| Workflow | 觸發時機 | 說明 |
+|---|---|---|
+| `GitHub Pages` | 每天 UTC 00:45–03:45，push | 計算收益統計，發 Telegram 日報，部署至 GitHub Pages |
+| `taichunmin auto-renew-2: fUSD` | 每 10 分鐘 | 自動調整 USD 放貸利率 |
+| `taichunmin auto-renew-2: fUST` | 每 10 分鐘 | 自動調整 UST 放貸利率 |
+
+---
+
+## Google Sheets 匯入
+
+```
+=IMPORTDATA("https://你的帳號.github.io/bitfinex-lending-bot-v2/funding-statistics-1/USD.csv?t=1")
+```
+
+---
+
+## 相關連結
+
+- [taichunmin/bitfinex-lending-bot](https://github.com/taichunmin/bitfinex-lending-bot)（原始專案）
 - [放貸機器人介紹](https://evestment.weebly.com/marginbotintro.html)
-- [業界公認！加密貨幣最穩低風險被動收入：我每月躺賺 10 萬利息的秘密！Bitfinex 綠葉放貸教學、收益來源、安全性、新手操作完全說明](https://www.youtube.com/watch?v=OL0cZabjl3U)
-
-## Related GitHub Repos
-
-| Repo | Stars | Forks |
-| ---- | ----- | ----- |
-| [taichunmin/js-bitfinex](https://github.com/taichunmin/js-bitfinex) | ![](https://img.shields.io/github/stars/taichunmin/js-bitfinex?style=flat) | ![](https://img.shields.io/github/forks/taichunmin/js-bitfinex?style=flat) |
-| [anandanand84/technicalindicators](https://github.com/anandanand84/technicalindicators) | ![](https://img.shields.io/github/stars/anandanand84/technicalindicators?style=flat) | ![](https://img.shields.io/github/forks/anandanand84/technicalindicators?style=flat) |
-| [BitBotFactory/MikaLendingBot](https://github.com/BitBotFactory/MikaLendingBot) | ![](https://img.shields.io/github/stars/BitBotFactory/MikaLendingBot?style=flat) | ![](https://img.shields.io/github/forks/BitBotFactory/MikaLendingBot?style=flat) |
-| [eAndrius/BitfinexLendingBot](https://github.com/eAndrius/BitfinexLendingBot) | ![](https://img.shields.io/github/stars/eAndrius/BitfinexLendingBot?style=flat) | ![](https://img.shields.io/github/forks/eAndrius/BitfinexLendingBot?style=flat) |
-| [huaying/bitfinex-lending-bot](https://github.com/huaying/bitfinex-lending-bot) | ![](https://img.shields.io/github/stars/huaying/bitfinex-lending-bot?style=flat) | ![](https://img.shields.io/github/forks/huaying/bitfinex-lending-bot?style=flat) |
-| [instabot42/funding-bot](https://github.com/instabot42/funding-bot) | ![](https://img.shields.io/github/stars/instabot42/funding-bot?style=flat) | ![](https://img.shields.io/github/forks/instabot42/funding-bot?style=flat) |
-| [drodil/bitfinex_bot](https://github.com/drodil/bitfinex_bot) | ![](https://img.shields.io/github/stars/drodil/bitfinex_bot?style=flat) | ![](https://img.shields.io/github/forks/drodil/bitfinex_bot?style=flat) |
-| [liverpool1026/funding_bot](https://github.com/liverpool1026/funding_bot) | ![](https://img.shields.io/github/stars/liverpool1026/funding_bot?style=flat) | ![](https://img.shields.io/github/forks/liverpool1026/funding_bot?style=flat) |
-| [a6984234/Andy-Bitfinex-Loan-Bot](https://github.com/a6984234/Andy-Bitfinex-Loan-Bot) | ![](https://img.shields.io/github/stars/a6984234/Andy-Bitfinex-Loan-Bot?style=flat) | ![](https://img.shields.io/github/forks/a6984234/Andy-Bitfinex-Loan-Bot?style=flat) |
-
-## Related Lending Bots
-
-- [用 AI 寫 Bitfinex 放貸機器人](https://marco79423.net/articles/%E9%9A%A8%E6%89%8B%E8%A8%98-%E7%94%A8-ai-%E5%AF%AB-bitfinex-%E6%94%BE%E8%B2%B8%E6%A9%9F%E5%99%A8%E4%BA%BA)
-- [BFX 放貸機器人程式碼](https://script.google.com/d/1wutEPT6g9hD7KD5HKloSOa-SW5Yy9hGm5zfTEPgtVZSuxThtCUj49l6h/edit?usp=sharing)
-  - [免費 Bitfinex 放貸機器人](https://yk-study.com/2022/06/29/666-2/)
-  - [程式碼備份 v2.4](https://gist.github.com/taichunmin/0ee4820e3a2cfa9775522baa500dd2d5)
+- [Bitfinex 放貸教學影片](https://www.youtube.com/watch?v=OL0cZabjl3U)
