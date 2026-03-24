@@ -12,7 +12,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment: aa85192
     env:
       BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
       BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
