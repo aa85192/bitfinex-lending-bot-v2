@@ -18,7 +18,6 @@ import { dayjs } from '../lib/dayjs.mjs'
 import { floatFormatDecimal } from '../lib/helper.mjs'
 import { createLoggersByUrl } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
-import * as bitfinexLib from '../lib/bitfinex.mjs'
 import Papa from 'papaparse'
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000
@@ -151,8 +150,8 @@ async function calcUtilizationByDate (currency: string): Promise<Record<string, 
   try {
     // hist: last 3 days of closed credits; active: currently open credits (use now as closedAt)
     const [histCredits, activeCredits] = await Promise.all([
-      bitfinexLib.getFundingCreditsHist({ currency, limit: 500 }),
-      bitfinexLib.getFundingCredits({ currency }),
+      bitfinex.v2AuthReadFundingCreditsHist({ currency, limit: 500 }),
+      bitfinex.v2AuthReadFundingCredits({ currency }),
     ])
     const now = Date.now()
     const credits = [

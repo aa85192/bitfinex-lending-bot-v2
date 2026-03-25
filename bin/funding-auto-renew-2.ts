@@ -220,7 +220,7 @@ export async function main (): Promise<void> {
   const creditsAmountSum = _.sumBy(credits, 'amount') ?? 0
   const ordersAmountSum = _.sumBy(orders, 'amount') ?? 0
   const creditIds = _.sortBy(_.map(credits, 'id'))
-  loggers.log({ creditsAmountSum, ordersAmountSum, creditIds })
+  loggers.log({ walletBalance: wallet.balance, creditsAmountSum, ordersAmountSum, creditIds })
 
   if (wallet.balance < Number.EPSILON) return
 
