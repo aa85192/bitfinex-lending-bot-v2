@@ -22,13 +22,18 @@ Bitfinex 自動放貸機器人，基於 [taichunmin/bitfinex-lending-bot](https:
 
 前往 Bitfinex → Account → API Keys，建立一組 API Key，需開啟以下權限：
 
-| 分類 | 權限 |
+| 分類 | 項目 |
 |---|---|
-| Account History | Read |
-| Orders | Read |
-| Margin Funding | Read、Write |
-| Wallets | Read |
-| Settings | Read、**Write** |
+| Account Info | Get account fee information |
+| Account History | Get historical balances entries and trade information |
+| Orders | Get orders and statuses |
+| Margin Trading | Get position and margin info |
+| Margin Funding | Get funding statuses and info |
+| Margin Funding | Offer, cancel and close funding |
+| Wallets | Get wallet balances and addresses |
+| Wallets | Transfer between your wallets |
+| Settings | Read account settings |
+| Settings | **Write account settings** |
 
 > Settings Write 用於在 Bitfinex 儲存 Telegram msgId，讓 bot 每次 edit 同一則訊息而非新增。
 
