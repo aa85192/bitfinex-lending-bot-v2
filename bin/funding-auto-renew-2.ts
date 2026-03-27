@@ -18,7 +18,7 @@ import * as url from 'node:url'
 import { z } from 'zod'
 import { dayjs } from '../lib/dayjs.mjs'
 import { dateStringify, floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, progressPercent, rateStringify } from '../lib/helper.mjs'
-import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
+import { createLoggersByUrl } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
 
 const loggers = createLoggersByUrl(import.meta.url)
@@ -231,34 +231,31 @@ export async function main (): Promise<void> {
 
   // 組成訊息
   const nowts = dayjs()
+  const creditLines = _.map(credits, c =>
+    `  ${floatFormatDecimal(c.amount, 3)} @ ${floatFormatPercent(c.rate, 6)} x ${c.period}天 (${dayjs(c.mtsOpening).utcOffset(8).format('M/D HH:mm')})`
+  ).join('\n')
   const msgText = [
-    telegram.tgMdEscape(`# ${filename}: ${cfg.currency} 狀態\n`),
+    `${filename}: ${cfg.currency} 狀態\n`,
     `投資額: ${floatFormatDecimal(wallet.balance, 3)}`,
     `已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${progressPercent(creditsAmountSum, wallet.balance)})`,
     `掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, wallet.balance)})`,
     `自動掛單設定:`,
-    `    利率: ${floatFormatPercent(target.rate, 6)}`,
-    `    APR: ${floatFormatPercent(target.rate * 365)}`,
-    `    天數: ${target.period}`,
-    `\n更新: ${telegram.tgMdEscape(nowts.format('M/D HH:mm'))} \\(${telegram.tgMdDate({ text: '?', date: nowts.toDate(), format: 'r' })}\\)`,
-    '',
-    `**&gt;\`\`\`\n${ymlStringify(_.map(credits, c => ({
-      ..._.pick(c, ['amount', 'period']),
-      rate: floatFormatPercent(c.rate, 6),
-      apr: floatFormatPercent(c.rate * 365),
-      mtsOpening: dayjs(c.mtsOpening).format('MM/DD HH:mm'),
-    })))}\n\`\`\`||**`,
+    `  利率: ${floatFormatPercent(target.rate, 6)}`,
+    `  APR: ${floatFormatPercent(target.rate * 365)}`,
+    `  天數: ${target.period}`,
+    `更新: ${nowts.utcOffset(8).format('M/D HH:mm')} (UTC+8)`,
+    credits.length > 0 ? `\n出借中:\n${creditLines}` : '',
   ].filter(Boolean).join('\n')
 
   if (_.isNumber(notified?.msgId)) {
-    const edited = await telegram.editMessageText({ message_id: notified.msgId, text: msgText, parse_mode: 'MarkdownV2' }).catch(loggers.error)
+    const edited = await telegram.editMessageText({ message_id: notified.msgId, text: msgText }).catch(loggers.error)
     if (!edited) {
       // edit 失敗（訊息被刪除或過期），改發新訊息
-      const res = await telegram.sendMessage({ text: msgText, parse_mode: 'MarkdownV2' }).catch(loggers.error)
+      const res = await telegram.sendMessage({ text: msgText }).catch(loggers.error)
       if (res?.message_id) db.notified[cfg.currency] = { msgId: res.message_id, balance: wallet.balance, creditIds }
     }
   } else {
-    const res = await telegram.sendMessage({ text: msgText, parse_mode: 'MarkdownV2' }).catch(loggers.error)
+    const res = await telegram.sendMessage({ text: msgText }).catch(loggers.error)
     if (res?.message_id) db.notified[cfg.currency] = { msgId: res.message_id, balance: wallet.balance, creditIds }
   }
   await bitfinex.v2AuthWriteSettingsSet({ [DB_KEY]: ZodDb.parse(db) }).catch(loggers.error)
