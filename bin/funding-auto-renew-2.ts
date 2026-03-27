@@ -17,8 +17,8 @@ import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
 import { dayjs } from '../lib/dayjs.mjs'
-import { dateStringify, floatFormatDecimal, floatFormatPercent, floatIsEqual, rateStringify } from '../lib/helper.mjs'
-import { createLoggersByUrl } from '../lib/logger.mjs'
+import { dateStringify, floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, progressPercent, rateStringify } from '../lib/helper.mjs'
+import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
 
 const loggers = createLoggersByUrl(import.meta.url)
@@ -30,12 +30,15 @@ const bitfinex = new Bitfinex({
   affCode: getenv('BITFINEX_AFF_CODE'),
 })
 
+const ZodDbNotified = z.object({
+  msgId: z.number().int(),
+  balance: z.number(),
+  creditIds: z.array(z.number().int()),
+})
 const ZodDb = z.object({
-  schema: z.literal(1),
-  msgId: z.number().int().nullish().catch(null),
-  balance: z.number().nullish().catch(null),
-  creditIds: z.array(z.number().int()).nullish().catch(null),
-}).catch({ schema: 1 })
+  schema: z.literal(2),
+  notified: z.record(z.string(), ZodDbNotified).default({}),
+}).catch({ schema: 2, notified: {} })
 
 function ymlDump (key: string, val: any): void {
   loggers.log(_.set({}, key, val))
@@ -72,7 +75,7 @@ export async function main (): Promise<void> {
     rateMin: rateStringify(cfg.rateMin),
     rateMax: rateStringify(cfg.rateMax),
   })
-  const DB_KEY = `api:${filename}_${cfg.currency}`
+  const DB_KEY = `api:${filename}`
   const dbRaw = await bitfinex.v2AuthReadSettings([DB_KEY]).catch(() => ({}))
   const db = ZodDb.parse(dbRaw[DB_KEY.slice(4)] ?? {})
   ymlDump('db', db)
@@ -90,14 +93,14 @@ export async function main (): Promise<void> {
   })
 
   // get status of auto funding
-  const autoFunding = await bitfinex.v2AuthReadFundingAutoStatus({ currency: cfg.currency })
-  if (_.isNil(autoFunding)) loggers.log({ autoRenew: { status: false } })
+  const autoRenew = await bitfinex.v2AuthReadFundingAutoStatus({ currency: cfg.currency })
+  if (_.isNil(autoRenew)) loggers.log({ autoRenew: { status: false } })
   else {
     ymlDump('autoRenew', {
       currency: cfg.currency,
-      rate: rateStringify(autoFunding.rate),
-      period: autoFunding.period,
-      amount: autoFunding.amount,
+      rate: rateStringify(autoRenew.rate),
+      period: autoRenew.period,
+      amount: autoRenew.amount,
     })
   }
 
@@ -198,15 +201,15 @@ export async function main (): Promise<void> {
   }
   ymlDump('target', { ...target, rate: rateStringify(target.rate) })
 
-  if (_.isMatchWith(autoFunding ?? {}, target, floatIsEqual)) {
+  if (_.isMatchWith(autoRenew ?? {}, target, floatIsEqual)) {
     loggers.log('Setting of auto-renew no change.')
   } else {
-    if (autoFunding) await bitfinex.v2AuthWriteFundingAuto({ ..._.pick(cfg, ['currency']), status: 0 })
+    if (autoRenew) await bitfinex.v2AuthWriteFundingAuto({ ..._.pick(cfg, ['currency']), status: 0 })
     await bitfinex.v2AuthWriteFundingOfferCancelAll(_.pick(cfg, ['currency']))
     await bitfinex.v2AuthWriteFundingAuto({
       ..._.pick(cfg, ['currency', 'amount']),
       period: target.period,
-      rate: target.rate * 100, // percentage of rate
+      rate: floatFloor8(target.rate * 100), // percentage of rate
       status: 1,
     }).catch(err => { throw _.merge(err, { data: { target } }) })
   }
@@ -224,38 +227,39 @@ export async function main (): Promise<void> {
 
   if (wallet.balance < Number.EPSILON) return
 
-  // 決定是否重用同一則訊息
-  let reuseMsgId = _.isNumber(db.msgId)
-  reuseMsgId &&= floatIsEqual(db.balance ?? 0, wallet.balance)
-  reuseMsgId &&= _.isEqual(db.creditIds ?? [], creditIds)
+  const notified = db.notified[cfg.currency]
 
   // 組成訊息
-  const pct = (part: number, total: number): string => total <= 0 ? '0.0%' : `${(100 * part / total).toFixed(1)}%`
-  const nowStr = dayjs().utcOffset(8).format('M/D HH:mm')
-  const creditLines = _.map(credits, c =>
-    `  ${floatFormatDecimal(c.amount, 3)} @ ${floatFormatPercent(c.rate, 6)} × ${c.period}天 (${dayjs(c.mtsOpening).utcOffset(8).format('M/D HH:mm')})`
-  ).join('\n')
+  const nowts = dayjs()
   const msgText = [
-    `${filename}: ${cfg.currency} 狀態\n`,
+    telegram.tgMdEscape(`# ${filename}: ${cfg.currency} 狀態\n`),
     `投資額: ${floatFormatDecimal(wallet.balance, 3)}`,
-    `已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${pct(creditsAmountSum, wallet.balance)})`,
-    `掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${pct(ordersAmountSum, wallet.balance)})`,
+    `已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${progressPercent(creditsAmountSum, wallet.balance)})`,
+    `掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, wallet.balance)})`,
     `自動掛單設定:`,
-    `    利率: ${rateStringify(target.rate)}`,
+    `    利率: ${floatFormatPercent(target.rate, 6)}`,
+    `    APR: ${floatFormatPercent(target.rate * 365)}`,
     `    天數: ${target.period}`,
-    `更新: ${nowStr} (UTC+8)`,
-    credits.length > 0 ? `\n出借中:\n${creditLines}` : '',
+    `\n更新: ${telegram.tgMdEscape(nowts.format('M/D HH:mm'))} \\(${telegram.tgMdDate({ text: '?', date: nowts.toDate(), format: 'r' })}\\)`,
+    '',
+    `**&gt;\`\`\`\n${ymlStringify(_.map(credits, c => ({
+      ..._.pick(c, ['amount', 'period']),
+      rate: floatFormatPercent(c.rate, 6),
+      apr: floatFormatPercent(c.rate * 365),
+      mtsOpening: dayjs(c.mtsOpening).format('MM/DD HH:mm'),
+    })))}\n\`\`\`||**`,
   ].filter(Boolean).join('\n')
 
-  if (reuseMsgId) {
-    await telegram.editMessageText({ message_id: db.msgId, text: msgText }).catch(loggers.error)
-  } else {
-    const res = await telegram.sendMessage({ text: msgText }).catch(loggers.error)
-    if (res?.message_id) {
-      db.msgId = res.message_id
-      db.balance = wallet.balance
-      db.creditIds = creditIds
+  if (_.isNumber(notified?.msgId)) {
+    const edited = await telegram.editMessageText({ message_id: notified.msgId, text: msgText, parse_mode: 'MarkdownV2' }).catch(loggers.error)
+    if (!edited) {
+      // edit 失敗（訊息被刪除或過期），改發新訊息
+      const res = await telegram.sendMessage({ text: msgText, parse_mode: 'MarkdownV2' }).catch(loggers.error)
+      if (res?.message_id) db.notified[cfg.currency] = { msgId: res.message_id, balance: wallet.balance, creditIds }
     }
+  } else {
+    const res = await telegram.sendMessage({ text: msgText, parse_mode: 'MarkdownV2' }).catch(loggers.error)
+    if (res?.message_id) db.notified[cfg.currency] = { msgId: res.message_id, balance: wallet.balance, creditIds }
   }
   await bitfinex.v2AuthWriteSettingsSet({ [DB_KEY]: ZodDb.parse(db) }).catch(loggers.error)
 }
