@@ -35,8 +35,6 @@ Bitfinex 自動放貸機器人，基於 [taichunmin/bitfinex-lending-bot](https:
 | Settings | Read account settings |
 | Settings | **Write account settings** |
 
-> Settings Write 用於在 Bitfinex 儲存 Telegram msgId，讓 bot 每次 edit 同一則訊息而非新增。
-
 ### Telegram Bot
 
 1. 向 [@BotFather](https://t.me/BotFather) 申請 Bot，取得 `TELEGRAM_TOKEN`
