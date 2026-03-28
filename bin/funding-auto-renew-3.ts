@@ -3,8 +3,10 @@ yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
 1. 取得過去一天內的每分鐘 K 線圖
-2. 把成交量加總 totalVolume
-3. 利用二分搜尋法，找出最接近 totalVolume * rank 的利率
+2. 對每根 K 線施加時間衰減權重（近期 K 線權重較高）
+3. 計算 Volume Ratio 偵測流動性枯竭
+4. 流動性不足時，將 FRR 作為合成錨點混入分布
+5. 利用二分搜尋法，找出最接近 totalVolume * rank 的利率
 */
 
 // import first before other imports
@@ -24,6 +26,7 @@ const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
 const DB_KEY = `api:taichunmin_${filename}`
 const RATE_MIN = 0.0001 // APR 3.65%
+const FRR_SPREAD_PCT = 0.05 // FRR 合成 range 的寬度（FRR 的 ±5%），無需調整
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -50,6 +53,10 @@ const ZodConfigCurrency = z.object({
   rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
   rateMin: z.coerce.number().min(RATE_MIN).default(0.0002),
   period: ZodConfigPeriod,
+  // === 新增：時間衰減與 FRR 混入參數 ===
+  decayHalfLife: z.coerce.number().positive().default(4), // 時間衰減半衰期（小時），預設 4 小時
+  frrTrustThreshold: z.coerce.number().positive().max(1).default(0.5), // volRatio 低於此值時開始混入 FRR（必須 > 0，避免除零）
+  frrMaxWeight: z.coerce.number().min(0).default(3), // FRR 合成量最多佔 totalVolume 的倍數
 })
 
 const ZodConfig = z.record(z.string(), ZodConfigCurrency).default({})
@@ -126,13 +133,51 @@ export async function main (): Promise<void> {
           timeframe: '1m',
         })
 
-        // ranges
+        // === 新增：計算時間衰減參數 ===
+        const now = Date.now()
+        // 半衰期轉換為衰減常數：decay = ln(2) / halfLife
+        // 在 0~1 的歸一化時間軸上（0=現在, 1=24小時前），halfLife 以小時為單位需除以 24
+        const decayLambda = Math.LN2 / (cfg1.decayHalfLife / 24)
+
+        // === 新增：計算 Volume Ratio（流動性偵測）===
+        const recentCutoffMs = dayjs().add(-2, 'hour').valueOf()
+        let recentVolRaw = 0
+        let totalVolRaw = 0
+        for (const c of candles) {
+          const vol = c.volume
+          totalVolRaw += vol
+          if (c.mts >= recentCutoffMs) recentVolRaw += vol
+        }
+        // 24h 分成 12 個 2h 區段的均值
+        const avgVol2h = totalVolRaw / 12
+        const volRatio = avgVol2h > 0 ? recentVolRaw / avgVol2h : 0
+
+        // frrTrust: 0 = 完全信任市場分布, 1 = 完全依賴 FRR
+        const frrTrust = Math.max(0, Math.min(1, 1 - volRatio / cfg1.frrTrustThreshold))
+
+        ymlDump('liquidityMetrics', {
+          recentVolRaw: floatFormatDecimal(recentVolRaw, 2),
+          totalVolRaw: floatFormatDecimal(totalVolRaw, 2),
+          avgVol2h: floatFormatDecimal(avgVol2h, 2),
+          volRatio: floatFormatDecimal(volRatio, 4),
+          frrTrust: floatFormatDecimal(frrTrust, 4),
+        })
+
+        // === 修改：ranges 加入時間衰減權重 ===
         const ranges = _.chain(candles)
-          .map(({ open, close, high, low, volume }) => _.map([
-              _.min([open, close, high, low]), // min * 1e8
+          .map((candle) => {
+            const { open, close, high, low, volume, mts } = candle
+            // 計算時間衰減權重
+            const age = (now - mts) / (24 * 3600 * 1000) // 0（現在）~1（24小時前）
+            const timeWeight = Math.exp(-decayLambda * age)
+            // 將 volume 乘以時間衰減權重
+            const weightedVolume = volume * timeWeight
+            return _.map([
+              _.min([open, close, high, low]), // low * 1e8
               _.max([open, close, high, low]), // high * 1e8
-              volume, // volume * 1e8
-            ], (num: number) => BigInt(_.round(num * 1e8))))
+              weightedVolume, // weightedVolume（浮點數，稍後轉 bigint）
+            ], (num: number) => BigInt(_.round(num * 1e8)))
+          })
           .filter(([low, high, volume]) => volume > 0n)
           .sortBy([0, 1, 2])
           .value()
@@ -144,7 +189,6 @@ export async function main (): Promise<void> {
           ranges.splice(i, 1)
           i--
         }
-        // console.log(`ranges.length = ${ranges.length}, ranges: ${JSON.stringify(_.take(ranges, 10))}`)
         if (ranges.length === 0) throw new SkipError('Skip to change autoRenew because no candles.')
 
         // for lowest rate and highest rate
@@ -154,7 +198,75 @@ export async function main (): Promise<void> {
           if (low < lowestRate) lowestRate = low
           totalVolume += volume
         }
-        // console.log(`lowestRate = ${lowestRate}, highestRate = ${highestRate}, totalVolume = ${totalVolume}`)
+
+        // BUG 2 改善：記錄衰減前後的 volume 比較，監控衰減強度是否合理
+        // totalVolRaw 是未衰減的原始成交量，totalVolume 是衰減加權後的（* 1e8）
+        const totalVolWeighted = Number(totalVolume) / 1e8
+        ymlDump('decayImpact', {
+          totalVolRaw: floatFormatDecimal(totalVolRaw, 4),
+          totalVolWeighted: floatFormatDecimal(totalVolWeighted, 4),
+          decayRetentionPct: totalVolRaw > 0
+            ? floatFormatPercent(totalVolWeighted / totalVolRaw)
+            : 'N/A',
+          halfLifeHours: cfg1.decayHalfLife,
+          rangesCount: ranges.length,
+        })
+
+        // === 新增：FRR 合成錨點混入 ===
+        if (frrTrust > 0 && totalVolume > 0n) {
+          // 檢查 FRR 資料是否可用
+          const frrAvailable = !_.isNil(fundingStats?.frr) && Number.isFinite(fundingStats.frr) && fundingStats.frr > 0
+
+          if (!frrAvailable) {
+            // 流動性不足但 FRR 資料不可用 — 這是需要被注意的狀態
+            loggers.error(`[${currency}] WARNING: Low liquidity detected (frrTrust=${floatFormatDecimal(frrTrust, 4)}) but FRR data unavailable (frr=${fundingStats?.frr}). FRR fallback SKIPPED — rate based on sparse market data only.`)
+          } else {
+            const frr = fundingStats.frr
+            const frrInt = BigInt(Math.round(frr * 1e8))
+            const spread = BigInt(Math.max(1, Math.round(frr * FRR_SPREAD_PCT * 1e8)))
+            const syntheticLow = frrInt - spread
+            const syntheticHigh = frrInt + spread
+
+            // BUG 1 修復：用 bigint basis-points 乘法，避免 Number(totalVolume) 超過 MAX_SAFE_INTEGER
+            // syntheticVol = totalVolume * frrTrust * frrMaxWeight
+            // 將浮點乘數轉為 basis points (萬分位) 再用 bigint 運算
+            const frrTrustBp = BigInt(Math.round(frrTrust * 10000))
+            const frrMaxWeightBp = BigInt(Math.round(cfg1.frrMaxWeight * 10000))
+            const syntheticVol = totalVolume * frrTrustBp * frrMaxWeightBp / 10000n / 10000n
+
+            if (syntheticVol > 0n) {
+              // 記錄混入前的 totalVolume，用於 log 語義正確（BUG 5 修正）
+              const totalVolumeBeforeInjection = totalVolume
+
+              ranges.push([syntheticLow, syntheticHigh, syntheticVol])
+              ranges.sort((a, b) => Number(a[0] - b[0]) || Number(a[1] - b[1]))
+
+              // D3 修正：FRR 插入後重新執行 duplicate merge
+              for (let i = 1; i < ranges.length; i++) {
+                if (ranges[i][0] !== ranges[i - 1][0] || ranges[i][1] !== ranges[i - 1][1]) continue
+                ranges[i - 1][2] += ranges[i][2]
+                ranges.splice(i, 1)
+                i--
+              }
+
+              // 更新邊界與總量
+              totalVolume += syntheticVol
+              if (syntheticLow < lowestRate) lowestRate = syntheticLow
+              if (syntheticHigh > highestRate) highestRate = syntheticHigh
+
+              ymlDump('frrInjection', {
+                frr: rateStringify(frr),
+                syntheticLow: Number(syntheticLow) / 1e8,
+                syntheticHigh: Number(syntheticHigh) / 1e8,
+                syntheticVol: syntheticVol.toString(),
+                totalVolumeBefore: totalVolumeBeforeInjection.toString(),
+                totalVolumeAfter: totalVolume.toString(),
+                syntheticRatio: floatFormatDecimal(Number(syntheticVol) / Number(totalVolumeBeforeInjection), 2),
+                syntheticPct: floatFormatPercent(Number(syntheticVol) / Number(totalVolume)),
+              })
+            }
+          }
+        }
 
         // binary search target rate by rank
         const ctxBs: Record<string, any> = {
@@ -163,7 +275,6 @@ export async function main (): Promise<void> {
           start: lowestRate,
           end: highestRate,
         }
-        // console.log(`ctxBs: ${JSON.stringify(ctxBs)}`)
         while (ctxBs.start <= ctxBs.end) {
           ctxBs.mid = (ctxBs.start + ctxBs.end) / 2n
 
@@ -189,7 +300,6 @@ export async function main (): Promise<void> {
           if (ctxBs.rank < ctxBs.midRank) ctxBs.end = ctxBs.mid - 1n
           else ctxBs.start = ctxBs.mid + 1n
           ctxBs.cnt++
-          // console.log(`ctxBs: ${JSON.stringify(ctxBs)}`)
         }
 
         // target
