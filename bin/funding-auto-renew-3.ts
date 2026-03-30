@@ -179,7 +179,7 @@ export async function main (): Promise<void> {
           for (const trade of fundingTrades) {
             const age = (now - +trade.mts) / (24 * 3600 * 1000) // +trade.mts 相容 Date 和 number
             const timeWeight = Math.exp(-decayLambda * age)
-            const w = trade.amount * timeWeight
+            const w = Math.abs(trade.amount) * timeWeight // amount 可能是負數（借出方主動成交），取絕對值
             weightedRateSum += trade.rate * w
             weightedVolSum += w
           }
