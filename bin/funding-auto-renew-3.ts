@@ -120,18 +120,26 @@ export async function main (): Promise<void> {
           })
         }
 
-        // get candles
+        // get candles + actual funding trades (parallel)
         const yesterday = dayjs().add(-1, 'day').add(-1, 'second').toDate()
-        const candles = await Bitfinex.v2CandlesHist({
-          aggregation: 30,
-          currency,
-          limit: 10000,
-          periodEnd: 30,
-          periodStart: 2,
-          sort: BitfinexSort.DESC,
-          start: yesterday,
-          timeframe: '1m',
-        })
+        const [candles, fundingTrades] = await Promise.all([
+          Bitfinex.v2CandlesHist({
+            aggregation: 30,
+            currency,
+            limit: 10000,
+            periodEnd: 30,
+            periodStart: 2,
+            sort: BitfinexSort.DESC,
+            start: yesterday,
+            timeframe: '1m',
+          }),
+          Bitfinex.v2TradesHist({
+            currency,
+            limit: 10000,
+            sort: BitfinexSort.DESC,
+            start: yesterday,
+          }),
+        ])
 
         // === 新增：計算時間衰減參數 ===
         const now = Date.now()
@@ -152,15 +160,35 @@ export async function main (): Promise<void> {
         const avgVol2h = totalVolRaw / 12
         const volRatio = avgVol2h > 0 ? recentVolRaw / avgVol2h : 0
 
-        // frrTrust: 0 = 完全信任市場分布, 1 = 完全依賴 FRR
-        const frrTrust = Math.max(0, Math.min(1, 1 - volRatio / cfg1.frrTrustThreshold))
+        // anchorTrust: 0 = 完全信任市場分布, 1 = 完全依賴錨點
+        const anchorTrust = Math.max(0, Math.min(1, 1 - volRatio / cfg1.frrTrustThreshold))
 
         ymlDump('liquidityMetrics', {
           recentVolRaw: floatFormatDecimal(recentVolRaw, 2),
           totalVolRaw: floatFormatDecimal(totalVolRaw, 2),
           avgVol2h: floatFormatDecimal(avgVol2h, 2),
           volRatio: floatFormatDecimal(volRatio, 4),
-          frrTrust: floatFormatDecimal(frrTrust, 4),
+          anchorTrust: floatFormatDecimal(anchorTrust, 4),
+        })
+
+        // 計算真實成交時間加權平均利率（錨點），優先於 FRR
+        let tradesAnchor: number | null = null
+        {
+          let weightedRateSum = 0
+          let weightedVolSum = 0
+          for (const trade of fundingTrades) {
+            const age = (now - trade.mts.getTime()) / (24 * 3600 * 1000)
+            const timeWeight = Math.exp(-decayLambda * age)
+            const w = trade.amount * timeWeight
+            weightedRateSum += trade.rate * w
+            weightedVolSum += w
+          }
+          if (weightedVolSum > Number.EPSILON) tradesAnchor = weightedRateSum / weightedVolSum
+        }
+        ymlDump('tradesAnchor', {
+          count: fundingTrades.length,
+          anchorStr: tradesAnchor != null ? rateStringify(tradesAnchor) : null,
+          fallbackFrrStr: rateStringify(fundingStats.frr),
         })
 
         // === 修改：ranges 加入時間衰減權重 ===
@@ -212,36 +240,30 @@ export async function main (): Promise<void> {
           rangesCount: ranges.length,
         })
 
-        // === 新增：FRR 合成錨點混入 ===
-        if (frrTrust > 0 && totalVolume > 0n) {
-          // 檢查 FRR 資料是否可用
-          const frrAvailable = !_.isNil(fundingStats?.frr) && Number.isFinite(fundingStats.frr) && fundingStats.frr > 0
+        // === 錨點混入（優先使用真實成交加權均值，退回 FRR）===
+        if (anchorTrust > 0 && totalVolume > 0n) {
+          const anchor = tradesAnchor ?? fundingStats?.frr ?? null
+          const anchorType = tradesAnchor != null ? 'trades' : 'frr'
+          const anchorAvailable = anchor != null && Number.isFinite(anchor) && anchor > 0
 
-          if (!frrAvailable) {
-            // 流動性不足但 FRR 資料不可用 — 這是需要被注意的狀態
-            loggers.error(`[${currency}] WARNING: Low liquidity detected (frrTrust=${floatFormatDecimal(frrTrust, 4)}) but FRR data unavailable (frr=${fundingStats?.frr}). FRR fallback SKIPPED — rate based on sparse market data only.`)
+          if (!anchorAvailable) {
+            loggers.error(`[${currency}] WARNING: Low liquidity (anchorTrust=${floatFormatDecimal(anchorTrust, 4)}) but no anchor available. Rate based on sparse market data only.`)
           } else {
-            const frr = fundingStats.frr
-            const frrInt = BigInt(Math.round(frr * 1e8))
-            const spread = BigInt(Math.max(1, Math.round(frr * FRR_SPREAD_PCT * 1e8)))
-            const syntheticLow = frrInt - spread
-            const syntheticHigh = frrInt + spread
+            const anchorInt = BigInt(Math.round(anchor * 1e8))
+            const spread = BigInt(Math.max(1, Math.round(anchor * FRR_SPREAD_PCT * 1e8)))
+            const syntheticLow = anchorInt - spread
+            const syntheticHigh = anchorInt + spread
 
-            // BUG 1 修復：用 bigint basis-points 乘法，避免 Number(totalVolume) 超過 MAX_SAFE_INTEGER
-            // syntheticVol = totalVolume * frrTrust * frrMaxWeight
-            // 將浮點乘數轉為 basis points (萬分位) 再用 bigint 運算
-            const frrTrustBp = BigInt(Math.round(frrTrust * 10000))
-            const frrMaxWeightBp = BigInt(Math.round(cfg1.frrMaxWeight * 10000))
-            const syntheticVol = totalVolume * frrTrustBp * frrMaxWeightBp / 10000n / 10000n
+            const anchorTrustBp = BigInt(Math.round(anchorTrust * 10000))
+            const anchorMaxWeightBp = BigInt(Math.round(cfg1.frrMaxWeight * 10000))
+            const syntheticVol = totalVolume * anchorTrustBp * anchorMaxWeightBp / 10000n / 10000n
 
             if (syntheticVol > 0n) {
-              // 記錄混入前的 totalVolume，用於 log 語義正確（BUG 5 修正）
               const totalVolumeBeforeInjection = totalVolume
 
               ranges.push([syntheticLow, syntheticHigh, syntheticVol])
               ranges.sort((a, b) => Number(a[0] - b[0]) || Number(a[1] - b[1]))
 
-              // D3 修正：FRR 插入後重新執行 duplicate merge
               for (let i = 1; i < ranges.length; i++) {
                 if (ranges[i][0] !== ranges[i - 1][0] || ranges[i][1] !== ranges[i - 1][1]) continue
                 ranges[i - 1][2] += ranges[i][2]
@@ -249,13 +271,13 @@ export async function main (): Promise<void> {
                 i--
               }
 
-              // 更新邊界與總量
               totalVolume += syntheticVol
               if (syntheticLow < lowestRate) lowestRate = syntheticLow
               if (syntheticHigh > highestRate) highestRate = syntheticHigh
 
-              ymlDump('frrInjection', {
-                frr: rateStringify(frr),
+              ymlDump('anchorInjection', {
+                anchorType,
+                anchor: rateStringify(anchor),
                 syntheticLow: Number(syntheticLow) / 1e8,
                 syntheticHigh: Number(syntheticHigh) / 1e8,
                 syntheticVol: syntheticVol.toString(),
