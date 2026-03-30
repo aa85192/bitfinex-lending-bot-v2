@@ -312,8 +312,11 @@ export async function main (): Promise<void> {
         }
         ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate) })
 
-        if (_.isMatch(prevAutoRenew ?? {}, newAutoRenew)) throw new SkipError('Setting of auto-renew no change.')
-        else {
+        if (_.isMatch(prevAutoRenew ?? {}, newAutoRenew)) {
+          trace.autoRenewChanged = false
+          loggers.log('Setting of auto-renew no change.')
+        } else {
+          trace.autoRenewChanged = true
           if (!_.isNil(prevAutoRenew)) await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
           await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
           await bitfinex.v2AuthWriteFundingAuto({
@@ -333,8 +336,12 @@ export async function main (): Promise<void> {
         const db1: Record<string, any> = db.notified?.[currency] ?? {}
         const autoRenew = _.pickBy(trace.newAutoRenew, _.isNumber)
 
-        // 取得出借中的融資
-        const credits = _.chain(await bitfinex.v2AuthReadFundingCredits({ currency }))
+        // 並行取得出借中的融資和掛單
+        const [creditsRaw, orders] = await Promise.all([
+          bitfinex.v2AuthReadFundingCredits({ currency }),
+          bitfinex.v2AuthReadFundingOffers({ currency }),
+        ])
+        const credits = _.chain(creditsRaw)
           .filter(({ side }) => side === 1)
           .map(credit => _.pick(credit, ['id', 'amount', 'rate', 'period', 'mtsOpening']))
           .map(credit => ({
@@ -346,9 +353,6 @@ export async function main (): Promise<void> {
           .value()
         const creditsAmountSum = _.sumBy(credits, 'amount')
         const creditIds = _.sortBy(_.map(credits, 'id'))
-
-        // 取得掛單並計算掛單中的總金額
-        const orders = await bitfinex.v2AuthReadFundingOffers({ currency })
         const ordersAmountSum = _.sumBy(orders, 'amount')
 
         const nowts = dayjs().utcOffset(8)
@@ -362,23 +366,29 @@ export async function main (): Promise<void> {
     利率: ${floatFormatPercent(autoRenew.rate, 6)}
     APR: ${floatFormatPercent(autoRenew.rate * 365)}
     天數: ${autoRenew.period}`),
-          `更新: ${telegram.tgMdEscape(nowts.format('M/D HH:mm'))} \\(${telegram.tgMdDate({ text: '?', date: nowts.toDate(), format: 'r' })}\\)\n`,
+          `更新: ${telegram.tgMdEscape(nowts.format('M/D HH:mm'))}\n`,
           '**>```',
           ymlStringify({ credits }),
           '```||',
         ].join('\n')
 
-        if (_.isNumber(db1.msgId)) {
+        const sendAndSave = async (opts: Record<string, unknown> = {}) => {
+          const res1 = await telegram.sendMessage({ parse_mode: 'MarkdownV2', text: msgText, ...opts })
+          _.set(db, `notified.${currency}`, { msgId: res1.message_id, balance: wallet.balance, creditIds })
+        }
+        if (trace.autoRenewChanged) {
+          // 利率有變 → 刪舊訊息、推播新訊息
+          if (_.isNumber(db1.msgId)) await telegram.deleteMessage({ message_id: db1.msgId }).catch(() => {})
+          await sendAndSave()
+        } else if (_.isNumber(db1.msgId)) {
+          // 利率未變 → 靜默 edit 同一則，edit 失敗才靜默發新訊息
           try {
             await telegram.editMessageText({ message_id: db1.msgId, parse_mode: 'MarkdownV2', text: msgText })
           } catch {
-            // edit 失敗（訊息被刪除或過期），改發新訊息
-            const res1 = await telegram.sendMessage({ parse_mode: 'MarkdownV2', text: msgText })
-            _.set(db, `notified.${currency}`, { msgId: res1.message_id, balance: wallet.balance, creditIds })
+            await sendAndSave({ disable_notification: true })
           }
         } else {
-          const res1 = await telegram.sendMessage({ parse_mode: 'MarkdownV2', text: msgText })
-          _.set(db, `notified.${currency}`, { msgId: res1.message_id, balance: wallet.balance, creditIds })
+          await sendAndSave()
         }
       }
     } catch (err) {

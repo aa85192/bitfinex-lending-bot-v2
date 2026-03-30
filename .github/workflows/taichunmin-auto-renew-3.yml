@@ -48,7 +48,8 @@ jobs:
           INPUT_AUTO_RENEW_3: |
             USD:
               amount: 0
-              rank: 0.8
+              rank: 0.6
+              frrMaxWeight: 1
               rateMax: 0.01
               rateMin: 0.0001
               period:
@@ -82,7 +83,8 @@ jobs:
                 30: 0.00082192
             UST:
               amount: 0
-              rank: 0.8
+              rank: 0.6
+              frrMaxWeight: 1
               rateMax: 0.01
               rateMin: 0.0001
               period:
