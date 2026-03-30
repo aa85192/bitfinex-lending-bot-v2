@@ -177,7 +177,7 @@ export async function main (): Promise<void> {
           let weightedRateSum = 0
           let weightedVolSum = 0
           for (const trade of fundingTrades) {
-            const age = (now - trade.mts.getTime()) / (24 * 3600 * 1000)
+            const age = (now - +trade.mts) / (24 * 3600 * 1000) // +trade.mts 相容 Date 和 number
             const timeWeight = Math.exp(-decayLambda * age)
             const w = trade.amount * timeWeight
             weightedRateSum += trade.rate * w
@@ -189,6 +189,12 @@ export async function main (): Promise<void> {
           count: fundingTrades.length,
           anchorStr: tradesAnchor != null ? rateStringify(tradesAnchor) : null,
           fallbackFrrStr: rateStringify(fundingStats.frr),
+          sample: fundingTrades[0] != null ? {
+            mts: String(fundingTrades[0].mts),
+            mtsMs: +fundingTrades[0].mts,
+            amount: fundingTrades[0].amount,
+            rate: fundingTrades[0].rate,
+          } : null,
         })
 
         // === 修改：ranges 加入時間衰減權重 ===
