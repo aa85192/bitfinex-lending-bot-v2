@@ -385,7 +385,7 @@ export async function main (): Promise<void> {
           try {
             await telegram.editMessageText({ message_id: db1.msgId, parse_mode: 'MarkdownV2', text: msgText })
           } catch {
-            await sendAndSave({ disable_notification: true })
+            await sendAndSave()
           }
         } else {
           await sendAndSave()
