@@ -49,7 +49,6 @@ jobs:
             USD:
               amount: 0
               rank: 0.6
-              frrMaxWeight: 0.1
               rateMax: 0.001
               rateMin: 0.0003
               period:
@@ -84,7 +83,6 @@ jobs:
             UST:
               amount: 0
               rank: 0.6
-              frrMaxWeight: 0.1
               rateMax: 0.001
               rateMin: 0.0003
               period:

@@ -2,23 +2,22 @@
 yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
-1. 取得過去一天內的每分鐘 K 線圖
-2. 對每根 K 線施加時間衰減權重（近期 K 線權重較高）
-3. 計算 Volume Ratio 偵測流動性枯竭
-4. 流動性不足時，將 FRR 作為合成錨點混入分布
-5. 利用二分搜尋法，找出最接近 totalVolume * rank 的利率
+1. 取得 Bitfinex Funding Book 快照（公開 API，最多 250 筆掛單）
+2. 篩選賣方（出借方）掛單：amount < 0
+3. 以 rank 百分位數找出目標利率
+4. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
 */
 
 // import first before other imports
 import { getenv } from '../lib/dotenv.mjs'
 
-import { Bitfinex, BitfinexSort, PlatformStatus } from '@taichunmin/bitfinex'
+import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
 import _ from 'lodash'
 import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
 import { dayjs } from '../lib/dayjs.mjs'
-import { dateStringify, floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
+import { floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
 
@@ -26,7 +25,6 @@ const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
 const DB_KEY = `api:taichunmin_${filename}`
 const RATE_MIN = 0.0001 // APR 3.65%
-const FRR_SPREAD_PCT = 0.05 // FRR 合成 range 的寬度（FRR 的 ±5%），無需調整
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -35,14 +33,6 @@ const bitfinex = new Bitfinex({
 
 function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
-}
-
-;(BigInt as any).prototype.toJSON ??= function () { // hack to support JSON.stringify
-  return this.toString()
-}
-
-function bigintAbs (a: bigint): bigint {
-  return a < 0n ? -a : a
 }
 
 const ZodConfigPeriod = z.record(
@@ -56,10 +46,6 @@ const ZodConfigCurrency = z.object({
   rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
   rateMin: z.coerce.number().min(RATE_MIN).default(0.0002),
   period: ZodConfigPeriod,
-  // === 新增：時間衰減與 FRR 混入參數 ===
-  decayHalfLife: z.coerce.number().positive().default(4), // 時間衰減半衰期（小時），預設 4 小時
-  frrTrustThreshold: z.coerce.number().positive().max(1).default(0.5), // volRatio 低於此值時開始混入 FRR（必須 > 0，避免除零）
-  frrMaxWeight: z.coerce.number().min(0).default(3), // FRR 合成量最多佔 totalVolume 的倍數
 })
 
 const ZodConfig = z.record(z.string(), ZodConfigCurrency).default({})
@@ -103,14 +89,6 @@ export async function main (): Promise<void> {
         rateMaxStr: rateStringify(cfg1.rateMax),
       })
 
-      // 取得該貨幣最新一筆融資統計
-      const fundingStats = (await Bitfinex.v2FundingStatsHist({ currency, limit: 1 }))[0]
-      ymlDump('fundingStats', {
-        currency,
-        date: dateStringify(fundingStats.mts),
-        frrStr: rateStringify(fundingStats.frr),
-      })
-
       // 修改 autoRenew 的參數
       try {
         // 取得該貨幣自動出借的設定
@@ -123,228 +101,44 @@ export async function main (): Promise<void> {
           })
         }
 
-        // get candles + actual funding trades (parallel)
-        const yesterday = dayjs().add(-1, 'day').add(-1, 'second').toDate()
-        const [candles, fundingTrades] = await Promise.all([
-          Bitfinex.v2CandlesHist({
-            aggregation: 30,
-            currency,
-            limit: 10000,
-            periodEnd: 30,
-            periodStart: 2,
-            sort: BitfinexSort.DESC,
-            start: yesterday,
-            timeframe: '1m',
-          }),
-          Bitfinex.v2TradesHist({
-            currency,
-            limit: 10000,
-            sort: BitfinexSort.DESC,
-            start: yesterday,
-          }),
-        ])
+        // 取得 Funding Book 快照（公開 API）
+        const bookResp = await fetch(`https://api-pub.bitfinex.com/v2/book/f${currency}/P0?len=250`)
+        if (!bookResp.ok) throw new Error(`[${currency}] Funding book fetch failed: HTTP ${bookResp.status}`)
+        const bookRaw: Array<[number, number, number, number]> = await bookResp.json()
 
-        // === 新增：計算時間衰減參數 ===
-        const now = Date.now()
-        // 半衰期轉換為衰減常數：decay = ln(2) / halfLife
-        // 在 0~1 的歸一化時間軸上（0=現在, 1=24小時前），halfLife 以小時為單位需除以 24
-        const decayLambda = Math.LN2 / (cfg1.decayHalfLife / 24)
+        // 賣方（出借方）：amount < 0，依利率由低到高排列
+        const lenderSide = bookRaw
+          .filter(([, , , amount]) => amount < 0)
+          .map(([rate, , , amount]) => ({ rate, amount: Math.abs(amount) }))
+          .sort((a, b) => a.rate - b.rate)
 
-        // === 新增：計算 Volume Ratio（流動性偵測）===
-        const recentCutoffMs = dayjs().add(-2, 'hour').valueOf()
-        let recentVolRaw = 0
-        let totalVolRaw = 0
-        for (const c of candles) {
-          const vol = c.volume
-          totalVolRaw += vol
-          if (c.mts >= recentCutoffMs) recentVolRaw += vol
-        }
-        // 24h 分成 12 個 2h 區段的均值
-        const avgVol2h = totalVolRaw / 12
-        const volRatio = avgVol2h > 0 ? recentVolRaw / avgVol2h : 0
-
-        // anchorTrust: 0 = 完全信任市場分布, 1 = 完全依賴錨點
-        const anchorTrust = Math.max(0, Math.min(1, 1 - volRatio / cfg1.frrTrustThreshold))
-
-        ymlDump('liquidityMetrics', {
-          recentVolRaw: floatFormatDecimal(recentVolRaw, 2),
-          totalVolRaw: floatFormatDecimal(totalVolRaw, 2),
-          avgVol2h: floatFormatDecimal(avgVol2h, 2),
-          volRatio: floatFormatDecimal(volRatio, 4),
-          anchorTrust: floatFormatDecimal(anchorTrust, 4),
+        const totalLenderAmount = _.sumBy(lenderSide, 'amount')
+        ymlDump('bookMetrics', {
+          totalEntries: bookRaw.length,
+          lenderEntries: lenderSide.length,
+          totalLenderAmount: floatFormatDecimal(totalLenderAmount, 2),
+          lowestRate: lenderSide[0] != null ? rateStringify(lenderSide[0].rate) : null,
+          highestRate: lenderSide.at(-1) != null ? rateStringify(lenderSide.at(-1)!.rate) : null,
         })
 
-        // 計算真實成交時間加權中位數利率（錨點），優先於 FRR
-        let tradesAnchor: number | null = null
+        if (lenderSide.length === 0) throw new SkipError(`[${currency}] Funding book has no lender-side entries.`)
+
+        // 找出 rank 百分位數對應的利率
+        let bookTargetRate = lenderSide.at(-1)!.rate
         {
-          const weighted: Array<{ rate: number, weight: number }> = fundingTrades
-            .map((trade: any) => ({
-              rate: trade.rate as number,
-              weight: Math.abs(trade.amount as number) * Math.exp(-decayLambda * ((now - +trade.mts) / (24 * 3600 * 1000))),
-            }))
-            .filter(({ weight }: { weight: number }) => weight > 0)
-            .sort((a: { rate: number }, b: { rate: number }) => a.rate - b.rate)
-          const totalWeight = weighted.reduce((sum: number, { weight }) => sum + weight, 0)
-          if (totalWeight > Number.EPSILON) {
-            let cumWeight = 0
-            for (const { rate, weight } of weighted) {
-              cumWeight += weight
-              if (cumWeight >= totalWeight * 0.5) { tradesAnchor = rate; break }
-            }
-          }
-        }
-        ymlDump('tradesAnchor', {
-          count: fundingTrades.length,
-          anchorStr: tradesAnchor != null ? rateStringify(tradesAnchor) : null,
-          fallbackFrrStr: rateStringify(fundingStats.frr),
-          sample: fundingTrades[0] != null ? {
-            mts: String(fundingTrades[0].mts),
-            mtsMs: +fundingTrades[0].mts,
-            amount: fundingTrades[0].amount,
-            rate: fundingTrades[0].rate,
-          } : null,
-        })
-
-        // === 修改：ranges 加入時間衰減權重 ===
-        const ranges = _.chain(candles)
-          .map((candle) => {
-            const { open, close, high, low, volume, mts } = candle
-            // 計算時間衰減權重
-            const age = (now - mts) / (24 * 3600 * 1000) // 0（現在）~1（24小時前）
-            const timeWeight = Math.exp(-decayLambda * age)
-            // 將 volume 乘以時間衰減權重
-            const weightedVolume = volume * timeWeight
-            return _.map([
-              _.min([open, close, high, low]), // low * 1e8
-              _.max([open, close, high, low]), // high * 1e8
-              weightedVolume, // weightedVolume（浮點數，稍後轉 bigint）
-            ], (num: number) => BigInt(_.round(num * 1e8)))
-          })
-          .filter(([low, high, volume]) => volume > 0n)
-          .sortBy([0, 1, 2])
-          .value()
-        // sum duplicate ranges
-        for (let i = 1; i < ranges.length; i++) {
-          const [low, high, volume] = ranges[i]
-          if (low !== ranges[i - 1][0] || high !== ranges[i - 1][1]) continue
-          ranges[i - 1][2] += volume
-          ranges.splice(i, 1)
-          i--
-        }
-        if (ranges.length === 0) throw new SkipError('Skip to change autoRenew because no candles.')
-
-        // for lowest rate and highest rate
-        let [lowestRate, highestRate, totalVolume] = [ranges[0][0], ranges[0][1], 0n]
-        for (const [low, high, volume] of ranges) {
-          if (high > highestRate) highestRate = high
-          if (low < lowestRate) lowestRate = low
-          totalVolume += volume
-        }
-
-        // BUG 2 改善：記錄衰減前後的 volume 比較，監控衰減強度是否合理
-        // totalVolRaw 是未衰減的原始成交量，totalVolume 是衰減加權後的（* 1e8）
-        const totalVolWeighted = Number(totalVolume) / 1e8
-        ymlDump('decayImpact', {
-          totalVolRaw: floatFormatDecimal(totalVolRaw, 4),
-          totalVolWeighted: floatFormatDecimal(totalVolWeighted, 4),
-          decayRetentionPct: totalVolRaw > 0
-            ? floatFormatPercent(totalVolWeighted / totalVolRaw)
-            : 'N/A',
-          halfLifeHours: cfg1.decayHalfLife,
-          rangesCount: ranges.length,
-        })
-
-        // === 錨點混入（優先使用真實成交加權均值，退回 FRR）===
-        if (anchorTrust > 0 && totalVolume > 0n) {
-          const anchor = tradesAnchor ?? fundingStats?.frr ?? null
-          const anchorType = tradesAnchor != null ? 'trades' : 'frr'
-          const anchorAvailable = anchor != null && Number.isFinite(anchor) && anchor > 0
-
-          if (!anchorAvailable) {
-            loggers.error(`[${currency}] WARNING: Low liquidity (anchorTrust=${floatFormatDecimal(anchorTrust, 4)}) but no anchor available. Rate based on sparse market data only.`)
-          } else {
-            const anchorInt = BigInt(Math.round(anchor * 1e8))
-            const spread = BigInt(Math.max(1, Math.round(anchor * FRR_SPREAD_PCT * 1e8)))
-            const syntheticLow = anchorInt - spread
-            const syntheticHigh = anchorInt + spread
-
-            const anchorTrustBp = BigInt(Math.round(anchorTrust * 10000))
-            const anchorMaxWeightBp = BigInt(Math.round(cfg1.frrMaxWeight * 10000))
-            const syntheticVol = totalVolume * anchorTrustBp * anchorMaxWeightBp / 10000n / 10000n
-
-            if (syntheticVol > 0n) {
-              const totalVolumeBeforeInjection = totalVolume
-
-              ranges.push([syntheticLow, syntheticHigh, syntheticVol])
-              ranges.sort((a, b) => Number(a[0] - b[0]) || Number(a[1] - b[1]))
-
-              for (let i = 1; i < ranges.length; i++) {
-                if (ranges[i][0] !== ranges[i - 1][0] || ranges[i][1] !== ranges[i - 1][1]) continue
-                ranges[i - 1][2] += ranges[i][2]
-                ranges.splice(i, 1)
-                i--
-              }
-
-              totalVolume += syntheticVol
-              if (syntheticLow < lowestRate) lowestRate = syntheticLow
-              if (syntheticHigh > highestRate) highestRate = syntheticHigh
-
-              ymlDump('anchorInjection', {
-                anchorType,
-                anchor: rateStringify(anchor),
-                syntheticLow: Number(syntheticLow) / 1e8,
-                syntheticHigh: Number(syntheticHigh) / 1e8,
-                syntheticVol: syntheticVol.toString(),
-                totalVolumeBefore: totalVolumeBeforeInjection.toString(),
-                totalVolumeAfter: totalVolume.toString(),
-                syntheticRatio: floatFormatDecimal(Number(syntheticVol) / Number(totalVolumeBeforeInjection), 2),
-                syntheticPct: floatFormatPercent(Number(syntheticVol) / Number(totalVolume)),
-              })
-            }
+          const targetCumAmount = totalLenderAmount * cfg1.rank
+          let cumAmount = 0
+          for (const { rate, amount } of lenderSide) {
+            cumAmount += amount
+            if (cumAmount >= targetCumAmount) { bookTargetRate = rate; break }
           }
         }
 
-        // binary search target rate by rank
-        const ctxBs: Record<string, any> = {
-          rank: BigInt(_.round(cfg1.rank * 1e8)),
-          cnt: 0n,
-          start: lowestRate,
-          end: highestRate,
-        }
-        while (ctxBs.start <= ctxBs.end) {
-          ctxBs.mid = (ctxBs.start + ctxBs.end) / 2n
-
-          // calculate volume for mid
-          ctxBs.midVol = 0n
-          for (const [low, high, volume] of ranges) {
-            if (ctxBs.mid < low) break // because ranges is sorted
-            ctxBs.midVol += ctxBs.mid >= high ? volume : (volume * (ctxBs.mid - low + 1n) / (high - low + 1n))
-          }
-          ctxBs.midRank = ctxBs.midVol * BigInt(1e8) / totalVolume
-
-          // save target rate
-          const targetRankDiff = bigintAbs((ctxBs.midRank - ctxBs.rank) as any)
-          if (_.isNil(ctxBs.targetRate)) {
-            ctxBs.targetRate = ctxBs.mid
-            ctxBs.targetRankDiff = targetRankDiff
-          } else if (targetRankDiff < ctxBs.targetRankDiff) {
-            ctxBs.targetRate = ctxBs.mid
-            ctxBs.targetRankDiff = targetRankDiff
-          }
-
-          if (ctxBs.midRank === ctxBs.rank) break // found
-          if (ctxBs.rank < ctxBs.midRank) ctxBs.end = ctxBs.mid - 1n
-          else ctxBs.start = ctxBs.mid + 1n
-          ctxBs.cnt++
-        }
-
-        // target
-        const targetRate = _.clamp(Number(ctxBs.targetRate) / 1e8, cfg1.rateMin, cfg1.rateMax)
         const newAutoRenew = trace.newAutoRenew = {
           amount: cfg1.amount,
           currency,
-          period: rateToPeriod(cfg1.period, targetRate),
-          rate: targetRate,
+          period: rateToPeriod(cfg1.period, _.clamp(bookTargetRate, cfg1.rateMin, cfg1.rateMax)),
+          rate: _.clamp(bookTargetRate, cfg1.rateMin, cfg1.rateMax),
         }
         ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate) })
 
