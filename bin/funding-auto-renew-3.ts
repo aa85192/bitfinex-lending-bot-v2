@@ -18,7 +18,7 @@ import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
 import { dayjs } from '../lib/dayjs.mjs'
-import { dateStringify, floatFloor8, floatFormatDecimal, floatFormatPercent, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
+import { dateStringify, floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
 
@@ -45,7 +45,10 @@ function bigintAbs (a: bigint): bigint {
   return a < 0n ? -a : a
 }
 
-const ZodConfigPeriod = z.record(z.string(), z.number().positive()).default({})
+const ZodConfigPeriod = z.record(
+  z.coerce.number().int().min(2).max(120),
+  z.number().positive(),
+).default({})
 
 const ZodConfigCurrency = z.object({
   amount: z.coerce.number().min(0).default(0),
@@ -171,19 +174,24 @@ export async function main (): Promise<void> {
           anchorTrust: floatFormatDecimal(anchorTrust, 4),
         })
 
-        // 計算真實成交時間加權平均利率（錨點），優先於 FRR
+        // 計算真實成交時間加權中位數利率（錨點），優先於 FRR
         let tradesAnchor: number | null = null
         {
-          let weightedRateSum = 0
-          let weightedVolSum = 0
-          for (const trade of fundingTrades) {
-            const age = (now - +trade.mts) / (24 * 3600 * 1000) // +trade.mts 相容 Date 和 number
-            const timeWeight = Math.exp(-decayLambda * age)
-            const w = Math.abs(trade.amount) * timeWeight // amount 可能是負數（借出方主動成交），取絕對值
-            weightedRateSum += trade.rate * w
-            weightedVolSum += w
+          const weighted: Array<{ rate: number, weight: number }> = fundingTrades
+            .map((trade: any) => ({
+              rate: trade.rate as number,
+              weight: Math.abs(trade.amount as number) * Math.exp(-decayLambda * ((now - +trade.mts) / (24 * 3600 * 1000))),
+            }))
+            .filter(({ weight }: { weight: number }) => weight > 0)
+            .sort((a: { rate: number }, b: { rate: number }) => a.rate - b.rate)
+          const totalWeight = weighted.reduce((sum: number, { weight }) => sum + weight, 0)
+          if (totalWeight > Number.EPSILON) {
+            let cumWeight = 0
+            for (const { rate, weight } of weighted) {
+              cumWeight += weight
+              if (cumWeight >= totalWeight * 0.5) { tradesAnchor = rate; break }
+            }
           }
-          if (weightedVolSum > Number.EPSILON) tradesAnchor = weightedRateSum / weightedVolSum
         }
         ymlDump('tradesAnchor', {
           count: fundingTrades.length,
@@ -400,22 +408,22 @@ export async function main (): Promise<void> {
           '```||',
         ].join('\n')
 
-        const sendAndSave = async (opts: Record<string, unknown> = {}) => {
-          const res1 = await telegram.sendMessage({ parse_mode: 'MarkdownV2', text: msgText, ...opts })
+        const sendAndSave = async () => {
+          const res1 = await telegram.sendMessage({ parse_mode: 'MarkdownV2', text: msgText })
           _.set(db, `notified.${currency}`, { msgId: res1.message_id, balance: wallet.balance, creditIds })
         }
-        if (trace.autoRenewChanged) {
-          // 利率有變 → 刪舊訊息、推播新訊息
-          if (_.isNumber(db1.msgId)) await telegram.deleteMessage({ message_id: db1.msgId }).catch(() => {})
-          await sendAndSave()
-        } else if (_.isNumber(db1.msgId)) {
-          // 利率未變 → 靜默 edit 同一則，edit 失敗才靜默發新訊息
+        // 餘額不變 + creditIds 不變 + msgId 存在 → 靜默 edit；否則刪舊、推播新訊息
+        const reuseMsgId = _.isNumber(db1.msgId)
+          && floatIsEqual(db1.balance, wallet.balance)
+          && _.isEqual(db1.creditIds, creditIds)
+        if (reuseMsgId) {
           try {
             await telegram.editMessageText({ message_id: db1.msgId, parse_mode: 'MarkdownV2', text: msgText })
           } catch {
             await sendAndSave()
           }
         } else {
+          if (_.isNumber(db1.msgId)) await telegram.deleteMessage({ message_id: db1.msgId }).catch(() => {})
           await sendAndSave()
         }
       }
