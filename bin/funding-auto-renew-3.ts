@@ -117,7 +117,7 @@ export async function main (): Promise<void> {
         // 定價：24h Funding Candles + 時間衰減
         // 每根 1 分鐘 K 線的 close 作為代表利率，volume × exp(-λΔt) 作為權重（半衰期 4 小時）
         const candlesResp = await fetch(
-          `https://api-pub.bitfinex.com/v2/candles/trade:1m:f${currency}/hist?limit=1440&sort=-1`
+          `https://api-pub.bitfinex.com/v2/candles/trade:1m:f${currency}:a30:p2:p30/hist?limit=1440&sort=-1`
         )
         if (!candlesResp.ok) {
           throw new Error(`[${currency}] Candles fetch failed: HTTP ${candlesResp.status}`)
