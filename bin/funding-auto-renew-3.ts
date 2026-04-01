@@ -2,9 +2,9 @@
 yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
-1. 取得 24 小時的 1 分鐘 Funding Candles（實際成交利率）
-2. 以 close 為代表利率、volume × 指數時間衰減為權重
-3. 在加權累積分佈中以 rank 百分位數找出目標利率
+1. 取得過去 24 小時的 1 分鐘 Funding Candles（實際成交利率）
+2. 每根 K 線展開為 [low, high] 利率區間，volume × 指數時間衰減為權重（半衰期 4 小時）
+3. 利用二分搜尋法，在加權累積分佈中找出 rank 百分位數對應的利率
 4. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
 
 不使用 FRR：自我強化迴圈使 FRR 系統性偏高。
@@ -14,7 +14,7 @@ yarn tsx ./bin/funding-auto-renew-3.ts
 // import first before other imports
 import { getenv } from '../lib/dotenv.mjs'
 
-import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
+import { Bitfinex, BitfinexSort, PlatformStatus } from '@taichunmin/bitfinex'
 import _ from 'lodash'
 import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
@@ -40,15 +40,8 @@ function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
 }
 
-// 在已按利率升序排列、以 weight 為量的分佈中，找出 rank 百分位對應的利率
-function rankRate (sorted: Array<{ rate: number, weight: number }>, total: number, rank: number): number {
-  const targetCum = total * rank
-  let cum = 0
-  for (const { rate, weight } of sorted) {
-    cum += weight
-    if (cum >= targetCum) return rate
-  }
-  return sorted.at(-1)!.rate
+function bigintAbs (a: bigint): bigint {
+  return a < 0n ? -a : a
 }
 
 const ZodConfigPeriod = z.record(
@@ -114,46 +107,78 @@ export async function main (): Promise<void> {
           })
         }
 
-        // 定價：24h Funding Candles + 時間衰減
-        // 每根 1 分鐘 K 線的 close 作為代表利率，volume × exp(-λΔt) 作為權重（半衰期 4 小時）
-        const candlesResp = await fetch(
-          `https://api-pub.bitfinex.com/v2/candles/trade:1m:f${currency}:a30:p2:p30/hist?limit=1440&sort=-1`
-        )
-        if (!candlesResp.ok) {
-          throw new Error(`[${currency}] Candles fetch failed: HTTP ${candlesResp.status}`)
-        }
-        const candlesRaw: Array<[number, number, number, number, number, number]> =
-          await candlesResp.json()
+        // 定價：24h Funding Candles + 時間衰減 + 二分搜尋
+        // 每根 K 線展開為 [low, high] 利率區間，volume × exp(-λΔt) 為權重（半衰期 4 小時）
+        const candles = await Bitfinex.v2CandlesHist({
+          aggregation: 30,
+          currency,
+          limit: 1440,
+          periodEnd: 30,
+          periodStart: 2,
+          sort: BitfinexSort.DESC,
+          timeframe: '1m',
+        })
 
         const now = Date.now()
-        const rateEntries = candlesRaw
-          .filter(([, , , , , vol]) => vol > 0)
-          .map(([mts, , close, , , volume]) => ({
-            rate: close,
-            weight: volume * Math.exp(-DECAY_LAMBDA * (now - mts)),
-          }))
-          .filter(({ weight }) => weight > Number.EPSILON)
-          .sort((a, b) => a.rate - b.rate)
+        const ranges: [bigint, bigint, bigint][] = candles
+          .map(({ open, close, high, low, volume, mts }): [bigint, bigint, bigint] => {
+            const timeWeight = Math.exp(-DECAY_LAMBDA * (now - mts))
+            return [
+              BigInt(_.round((_.min([open, close, high, low]) as number) * 1e8)),
+              BigInt(_.round((_.max([open, close, high, low]) as number) * 1e8)),
+              BigInt(_.round(volume * timeWeight * 1e8)),
+            ]
+          })
+          .filter(([,, volume]) => volume > 0n)
+          .sort((a, b) => Number(a[0] - b[0]) || Number(a[1] - b[1]) || Number(a[2] - b[2]))
 
-        const totalWeight = _.sumBy(rateEntries, 'weight')
+        // sum duplicate ranges
+        for (let i = 1; i < ranges.length; i++) {
+          if (ranges[i][0] !== ranges[i - 1][0] || ranges[i][1] !== ranges[i - 1][1]) continue
+          ranges[i - 1][2] += ranges[i][2]
+          ranges.splice(i, 1)
+          i--
+        }
+
+        if (ranges.length === 0) throw new SkipError(`[${currency}] No valid candle data.`)
+
+        let [lowestRate, highestRate, totalVolume] = [ranges[0][0], ranges[0][1], 0n]
+        for (const [low, high, volume] of ranges) {
+          if (high > highestRate) highestRate = high
+          if (low < lowestRate) lowestRate = low
+          totalVolume += volume
+        }
 
         ymlDump('candleMetrics', {
-          rawCount: candlesRaw.length,
-          validEntries: rateEntries.length,
-          totalWeight: floatFormatDecimal(totalWeight, 2),
-          lowestRate: rateEntries[0] != null ? rateStringify(rateEntries[0].rate) : null,
-          highestRate: rateEntries.at(-1) != null ? rateStringify(rateEntries.at(-1)!.rate) : null,
+          rawCount: candles.length,
+          rangesCount: ranges.length,
+          lowestRate: rateStringify(Number(lowestRate) / 1e8),
+          highestRate: rateStringify(Number(highestRate) / 1e8),
           decayHalfLifeHours: DECAY_HALF_LIFE_MS / 3_600_000,
         })
 
-        if (rateEntries.length === 0 || totalWeight <= 0) {
-          throw new SkipError(`[${currency}] No valid candle data available.`)
+        // binary search target rate by rank
+        const rankBigint = BigInt(_.round(cfg1.rank * 1e8))
+        let [bsStart, bsEnd, bsTargetRate, bsTargetDiff] = [lowestRate, highestRate, lowestRate, BigInt(1e8)]
+        while (bsStart <= bsEnd) {
+          const mid = (bsStart + bsEnd) / 2n
+          let midVol = 0n
+          for (const [low, high, volume] of ranges) {
+            if (mid < low) break
+            midVol += mid >= high ? volume : (volume * (mid - low + 1n) / (high - low + 1n))
+          }
+          const midRank = midVol * BigInt(1e8) / totalVolume
+          const diff = bigintAbs(midRank - rankBigint)
+          if (diff < bsTargetDiff) { bsTargetRate = mid; bsTargetDiff = diff }
+          if (midRank === rankBigint) break
+          if (rankBigint < midRank) bsEnd = mid - 1n
+          else bsStart = mid + 1n
         }
 
-        const targetRate = rankRate(rateEntries, totalWeight, cfg1.rank)
+        const targetRate = Number(bsTargetRate) / 1e8
 
         ymlDump('pricing', {
-          method: 'candle_percentile',
+          method: 'candle_range_bs',
           rank: cfg1.rank,
           targetRate,
           targetRateStr: rateStringify(targetRate),
