@@ -2,10 +2,16 @@
 yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
-1. 取得 Bitfinex Funding Book 快照（公開 API，最多 250 筆掛單）
-2. 篩選賣方（出借方）掛單：amount < 0
-3. 以 rank 百分位數找出目標利率
-4. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
+1. 主要：取得 Bitfinex Funding Book 快照（P1 聚合精度，公開 API，最多 250 筆）
+   - 篩選 ask side（放貸方掛單，amount < 0）
+   - 以 rank 百分位數在累積掛單量中找出目標利率
+2. Fallback：當 Book 深度不足時，取得 24 小時的 1 分鐘 Funding Candles
+   - 以 close 作為代表利率、volume × 指數衰減作為權重
+   - 以 rank 百分位數在加權累積分佈中找出目標利率
+3. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
+
+不使用 FRR：FRR 存在自我強化迴圈（大量用戶綁定 FRR → FRR 成交回饋進
+FRR 計算 → FRR 被自己錨定在高位），不反映真實市場均衡。
 */
 
 // import first before other imports
@@ -25,6 +31,9 @@ const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
 const DB_KEY = `api:taichunmin_${filename}`
 const RATE_MIN = 0.0001 // APR 3.65%
+const MIN_BOOK_ENTRIES = 20 // Book ask side 少於此數量時 fallback 到 candles
+const DECAY_HALF_LIFE_MS = 4 * 60 * 60 * 1000 // Candles 時間衰減半衰期：4 小時
+const DECAY_LAMBDA = Math.LN2 / DECAY_HALF_LIFE_MS
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -33,6 +42,17 @@ const bitfinex = new Bitfinex({
 
 function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
+}
+
+// 在已按利率升序排列、以 weight 為量的分佈中，找出 rank 百分位對應的利率
+function rankRate (sorted: Array<{ rate: number, weight: number }>, total: number, rank: number): number {
+  const targetCum = total * rank
+  let cum = 0
+  for (const { rate, weight } of sorted) {
+    cum += weight
+    if (cum >= targetCum) return rate
+  }
+  return sorted.at(-1)!.rate // 保底：total > 0 時迴圈必定命中，此行理論上不執行
 }
 
 const ZodConfigPeriod = z.record(
@@ -101,37 +121,109 @@ export async function main (): Promise<void> {
           })
         }
 
-        // 取得 Funding Book 快照（公開 API）
-        const bookResp = await fetch(`https://api-pub.bitfinex.com/v2/book/f${currency}/P0?len=250`)
-        if (!bookResp.ok) throw new Error(`[${currency}] Funding book fetch failed: HTTP ${bookResp.status}`)
-        const bookRaw: Array<[number, number, number, number]> = await bookResp.json()
+        // ═══════════════════════════════════════════════════════════
+        // 定價：Funding Book（P1 聚合精度）為主，Candles + 時間衰減為 fallback
+        //
+        // P1 vs P0：P0 每個 entry 是單一利率的掛單，250 筆只涵蓋最低的 250 個價位。
+        // P1 把相近利率聚合成一個 entry，250 筆涵蓋範圍大幅擴大。
+        //
+        // 不使用 FRR：FRR 存在自我強化迴圈（大量用戶綁定 FRR → FRR 成交回饋進
+        // FRR 計算 → FRR 被自己錨定在高位），不反映真實市場均衡。
+        // ═══════════════════════════════════════════════════════════
+        let bookTargetRate: number
 
-        // 賣方（出借方）：amount < 0，依利率由低到高排列
-        const lenderSide = bookRaw
+        // ── Primary: Funding Book (P1 精度) ──────────────────────
+        const bookResp = await fetch(
+          `https://api-pub.bitfinex.com/v2/book/f${currency}/P1?len=250`
+        )
+        if (!bookResp.ok) {
+          throw new Error(`[${currency}] Funding book fetch failed: HTTP ${bookResp.status}`)
+        }
+        const bookRaw: Array<[number, number, number, number]> = await bookResp.json()
+        // Format: [RATE, PERIOD, COUNT, AMOUNT]
+        // amount < 0 → ask side（放貸方掛單，供給）
+        // amount > 0 → bid side（借方掛單，需求）
+
+        const askSide = bookRaw
           .filter(([, , , amount]) => amount < 0)
-          .map(([rate, , , amount]) => ({ rate, amount: Math.abs(amount) }))
+          .map(([rate, , , amount]) => ({ rate, weight: Math.abs(amount) }))
           .sort((a, b) => a.rate - b.rate)
 
-        const totalLenderAmount = _.sumBy(lenderSide, 'amount')
+        const totalAskAmount = _.sumBy(askSide, 'weight')
+
         ymlDump('bookMetrics', {
           totalEntries: bookRaw.length,
-          lenderEntries: lenderSide.length,
-          totalLenderAmount: floatFormatDecimal(totalLenderAmount, 2),
-          lowestRate: lenderSide[0] != null ? rateStringify(lenderSide[0].rate) : null,
-          highestRate: lenderSide.at(-1) != null ? rateStringify(lenderSide.at(-1)!.rate) : null,
+          askEntries: askSide.length,
+          totalAskAmount: floatFormatDecimal(totalAskAmount, 2),
+          lowestRate: askSide[0] != null ? rateStringify(askSide[0].rate) : null,
+          highestRate: askSide.at(-1) != null ? rateStringify(askSide.at(-1)!.rate) : null,
         })
 
-        if (lenderSide.length === 0) throw new SkipError(`[${currency}] Funding book has no lender-side entries.`)
+        // ── 判斷 book 深度是否足夠 ──────────────────────────────
+        if (askSide.length >= MIN_BOOK_ENTRIES && totalAskAmount > 0) {
+          // ✅ Book 深度足夠 → ask side 累積分佈的 rank 百分位數
+          bookTargetRate = rankRate(askSide, totalAskAmount, cfg1.rank)
 
-        // 找出 rank 百分位數對應的利率
-        let bookTargetRate = lenderSide.at(-1)!.rate
-        {
-          const targetCumAmount = totalLenderAmount * cfg1.rank
-          let cumAmount = 0
-          for (const { rate, amount } of lenderSide) {
-            cumAmount += amount
-            if (cumAmount >= targetCumAmount) { bookTargetRate = rate; break }
+          ymlDump('pricing', {
+            method: 'funding_book_P1',
+            rank: cfg1.rank,
+            bookTargetRate,
+            bookTargetRateStr: rateStringify(bookTargetRate),
+          })
+        } else {
+          // ⚠️ Book 深度不足 → fallback: 24h Candles + 時間衰減
+          //
+          // 每根 candle 用 close 作為該分鐘的代表利率（避免 [low,high] 均勻分佈假設），
+          // volume 乘以指數衰減（半衰期 4 小時），讓近期成交權重更高。
+          loggers.log(`[${currency}] Book depth insufficient (${askSide.length} < ${MIN_BOOK_ENTRIES}), falling back to candles.`)
+
+          const candlesResp = await fetch(
+            `https://api-pub.bitfinex.com/v2/candles/trade:1m:f${currency}/hist?limit=720&sort=-1`
+          )
+          if (!candlesResp.ok) {
+            throw new Error(`[${currency}] Candles fetch failed: HTTP ${candlesResp.status}`)
           }
+          const candlesRaw: Array<[number, number, number, number, number, number]> =
+            await candlesResp.json()
+          // Format: [MTS, OPEN, CLOSE, HIGH, LOW, VOLUME]
+
+          const now = Date.now()
+          const rateEntries = candlesRaw
+            .filter(([, , , , , vol]) => vol > 0)
+            .map(([mts, , close, , , volume]) => ({
+              rate: close,
+              weight: volume * Math.exp(-DECAY_LAMBDA * (now - mts)),
+            }))
+            .filter(({ weight }) => weight > Number.EPSILON)
+            .sort((a, b) => a.rate - b.rate)
+
+          const totalWeight = _.sumBy(rateEntries, 'weight')
+
+          ymlDump('candleMetrics', {
+            rawCount: candlesRaw.length,
+            validEntries: rateEntries.length,
+            totalWeight: floatFormatDecimal(totalWeight, 2),
+            lowestRate: rateEntries[0] != null ? rateStringify(rateEntries[0].rate) : null,
+            highestRate: rateEntries.at(-1) != null ? rateStringify(rateEntries.at(-1)!.rate) : null,
+            decayHalfLifeHours: DECAY_HALF_LIFE_MS / 3_600_000,
+          })
+
+          if (rateEntries.length === 0 || totalWeight <= 0) {
+            throw new SkipError(
+              `[${currency}] Book depth insufficient and no valid candle data.`
+            )
+          }
+
+          bookTargetRate = rankRate(rateEntries, totalWeight, cfg1.rank)
+
+          ymlDump('pricing', {
+            method: 'candle_fallback',
+            reason: `book ask entries ${askSide.length} < ${MIN_BOOK_ENTRIES}`,
+            rank: cfg1.rank,
+            candleEntries: rateEntries.length,
+            bookTargetRate,
+            bookTargetRateStr: rateStringify(bookTargetRate),
+          })
         }
 
         const newAutoRenew = trace.newAutoRenew = {
