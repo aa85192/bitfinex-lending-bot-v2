@@ -177,6 +177,150 @@ export async function main (): Promise<void> {
 
         const targetRate = Number(bsTargetRate) / 1e8
 
+        // === 完整診斷 log ===
+
+        // 1. 百分位數分布（找出 FRR 污染的邊界在哪）
+        const percentiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99]
+        const pctMap: Record<string, string> = {}
+        for (const p of percentiles) {
+          const pRank = BigInt(_.round(p * 1e8))
+          let pRate = lowestRate
+          let cumVol = 0n
+          for (const [low, high, volume] of ranges) {
+            if (cumVol + volume >= totalVolume * pRank / BigInt(1e8)) {
+              const remaining = totalVolume * pRank / BigInt(1e8) - cumVol
+              pRate = volume > 0n ? low + (high - low) * remaining / volume : low
+              break
+            }
+            cumVol += volume
+          }
+          pctMap[`p${_.round(p * 100)}`] = rateStringify(Number(pRate) / 1e8)
+        }
+        ymlDump('distribution', pctMap)
+
+        // 2. 成交量集中度分析（看 FRR 污染佔多少比例）
+        const frrThreshold = 0.0002 // APR 7.3% 以下視為可能的 FRR 匹配
+        const frrThresholdInt = BigInt(_.round(frrThreshold * 1e8))
+        let volBelowThreshold = 0n
+        let volAboveThreshold = 0n
+        let rangesBelowCount = 0
+        let rangesAboveCount = 0
+        for (const [low, high, volume] of ranges) {
+          if (high <= frrThresholdInt) {
+            volBelowThreshold += volume
+            rangesBelowCount++
+          } else if (low >= frrThresholdInt) {
+            volAboveThreshold += volume
+            rangesAboveCount++
+          } else {
+            const totalRange = high - low + 1n
+            const belowPart = frrThresholdInt - low
+            const abovePart = high - frrThresholdInt
+            volBelowThreshold += volume * belowPart / totalRange
+            volAboveThreshold += volume * abovePart / totalRange
+            rangesBelowCount++
+            rangesAboveCount++
+          }
+        }
+        ymlDump('volumeConcentration', {
+          frrThreshold: rateStringify(frrThreshold),
+          belowThresholdVol: floatFormatDecimal(Number(volBelowThreshold) / 1e8, 2),
+          aboveThresholdVol: floatFormatDecimal(Number(volAboveThreshold) / 1e8, 2),
+          belowThresholdPct: floatFormatPercent(Number(volBelowThreshold) / Number(totalVolume)),
+          aboveThresholdPct: floatFormatPercent(Number(volAboveThreshold) / Number(totalVolume)),
+          rangesBelowCount,
+          rangesAboveCount,
+          totalRanges: ranges.length,
+        })
+
+        // 3. 時間衰減影響分析（衰減前後的分布比較）
+        const rangesRaw: [bigint, bigint, bigint][] = candles
+          .map(({ open, close, high, low, volume }): [bigint, bigint, bigint] => [
+            BigInt(_.round((_.min([open, close, high, low]) as number) * 1e8)),
+            BigInt(_.round((_.max([open, close, high, low]) as number) * 1e8)),
+            BigInt(_.round(volume * 1e8)),
+          ])
+          .filter(([,, v]) => v > 0n)
+          .sort((a, b) => Number(a[0] - b[0]) || Number(a[1] - b[1]) || Number(a[2] - b[2]))
+        for (let i = 1; i < rangesRaw.length; i++) {
+          if (rangesRaw[i][0] !== rangesRaw[i - 1][0] || rangesRaw[i][1] !== rangesRaw[i - 1][1]) continue
+          rangesRaw[i - 1][2] += rangesRaw[i][2]
+          rangesRaw.splice(i, 1)
+          i--
+        }
+        let totalVolRaw = 0n
+        for (const [,, v] of rangesRaw) totalVolRaw += v
+        const rawPctMap: Record<string, string> = {}
+        for (const p of percentiles) {
+          const pRank = BigInt(_.round(p * 1e8))
+          let pRate = rangesRaw[0]?.[0] ?? 0n
+          let cumVol = 0n
+          for (const [low, high, volume] of rangesRaw) {
+            if (cumVol + volume >= totalVolRaw * pRank / BigInt(1e8)) {
+              const remaining = totalVolRaw * pRank / BigInt(1e8) - cumVol
+              pRate = volume > 0n ? low + (high - low) * remaining / volume : low
+              break
+            }
+            cumVol += volume
+          }
+          rawPctMap[`p${_.round(p * 100)}`] = rateStringify(Number(pRate) / 1e8)
+        }
+        ymlDump('distributionNoDecay', rawPctMap)
+        ymlDump('decayComparison', {
+          totalVolWeighted: floatFormatDecimal(Number(totalVolume) / 1e8, 2),
+          totalVolRaw: floatFormatDecimal(Number(totalVolRaw) / 1e8, 2),
+          retentionPct: floatFormatPercent(Number(totalVolume) / Number(totalVolRaw)),
+        })
+
+        // 4. 最近 2 小時 vs 全天的利率比較
+        const recentCutoff = now - 2 * 60 * 60 * 1000
+        const recentCandles = candles.filter(c => +c.mts >= recentCutoff)
+        const olderCandles = candles.filter(c => +c.mts < recentCutoff)
+        const avgRate = (list: typeof candles): number => {
+          let sumRateVol = 0; let sumVol = 0
+          for (const c of list) {
+            if (c.volume <= 0) continue
+            const mid = (Math.min(c.open, c.close, c.high, c.low) + Math.max(c.open, c.close, c.high, c.low)) / 2
+            sumRateVol += mid * c.volume; sumVol += c.volume
+          }
+          return sumVol > 0 ? sumRateVol / sumVol : 0
+        }
+        ymlDump('recentVsOlder', {
+          recent2h: { count: recentCandles.length, avgRate: rateStringify(avgRate(recentCandles)), totalVol: floatFormatDecimal(_.sumBy(recentCandles, 'volume'), 2) },
+          older22h: { count: olderCandles.length, avgRate: rateStringify(avgRate(olderCandles)), totalVol: floatFormatDecimal(_.sumBy(olderCandles, 'volume'), 2) },
+        })
+
+        // 5. High vs Close 比較（看 FRR 匹配拉低 close 的程度）
+        const highCloseGaps = candles
+          .filter(c => c.volume > 0 && c.high > 0)
+          .map(c => ({ gap: c.high - c.close, gapPct: (c.high - c.close) / c.high, volume: c.volume }))
+        const significantGaps = highCloseGaps.filter(g => g.gapPct > 0.3)
+        ymlDump('highCloseAnalysis', {
+          totalCandles: highCloseGaps.length,
+          avgGapPct: floatFormatPercent(_.meanBy(highCloseGaps, 'gapPct')),
+          medianGapPct: floatFormatPercent(_.sortBy(highCloseGaps, 'gapPct')[Math.floor(highCloseGaps.length / 2)]?.gapPct ?? 0),
+          significantGapCount: significantGaps.length,
+          significantGapAvgVol: floatFormatDecimal(_.meanBy(significantGaps, 'volume') ?? 0, 2),
+          normalGapAvgVol: floatFormatDecimal(_.meanBy(highCloseGaps.filter(g => g.gapPct <= 0.3), 'volume') ?? 0, 2),
+        })
+
+        // 6. 每小時利率趨勢（看是否有時段效應）
+        const hourlyBuckets: Record<number, { sumRate: number, sumVol: number }> = {}
+        for (const c of candles) {
+          if (c.volume <= 0) continue
+          const hour = new Date(c.mts).getUTCHours()
+          if (!hourlyBuckets[hour]) hourlyBuckets[hour] = { sumRate: 0, sumVol: 0 }
+          const mid = (Math.min(c.open, c.close, c.high, c.low) + Math.max(c.open, c.close, c.high, c.low)) / 2
+          hourlyBuckets[hour].sumRate += mid * c.volume
+          hourlyBuckets[hour].sumVol += c.volume
+        }
+        const hourlyRates: Record<string, string> = {}
+        for (const h of _.sortBy(_.keys(hourlyBuckets).map(Number))) {
+          const b = hourlyBuckets[h]
+          hourlyRates[`${String(h).padStart(2, '0')}:00`] = `${rateStringify(b.sumVol > 0 ? b.sumRate / b.sumVol : 0)} vol=${floatFormatDecimal(b.sumVol, 0)}`
+        }
+        ymlDump('hourlyRates', hourlyRates)
+
         ymlDump('pricing', {
           method: 'candle_range_bs',
           rank: cfg1.rank,
