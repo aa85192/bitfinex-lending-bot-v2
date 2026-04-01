@@ -2,16 +2,13 @@
 yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
-1. 主要：取得 Bitfinex Funding Book 快照（P1 聚合精度，公開 API，最多 250 筆）
-   - 篩選 ask side（放貸方掛單，amount < 0）
-   - 以 rank 百分位數在累積掛單量中找出目標利率
-2. Fallback：當 Book 深度不足時，取得 24 小時的 1 分鐘 Funding Candles
-   - 以 close 作為代表利率、volume × 指數衰減作為權重
-   - 以 rank 百分位數在加權累積分佈中找出目標利率
-3. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
+1. 取得 24 小時的 1 分鐘 Funding Candles（實際成交利率）
+2. 以 close 為代表利率、volume × 指數時間衰減為權重
+3. 在加權累積分佈中以 rank 百分位數找出目標利率
+4. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
 
-不使用 FRR：FRR 存在自我強化迴圈（大量用戶綁定 FRR → FRR 成交回饋進
-FRR 計算 → FRR 被自己錨定在高位），不反映真實市場均衡。
+不使用 FRR：自我強化迴圈使 FRR 系統性偏高。
+不使用 Funding Book：book 上只有未成交的掛單（利率太低沒人借的），不反映真實成交行情。
 */
 
 // import first before other imports
@@ -31,8 +28,7 @@ const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
 const DB_KEY = `api:taichunmin_${filename}`
 const RATE_MIN = 0.0001 // APR 3.65%
-const MIN_BOOK_ENTRIES = 20 // Book ask side 少於此數量時 fallback 到 candles
-const DECAY_HALF_LIFE_MS = 4 * 60 * 60 * 1000 // Candles 時間衰減半衰期：4 小時
+const DECAY_HALF_LIFE_MS = 4 * 60 * 60 * 1000 // 時間衰減半衰期：4 小時
 const DECAY_LAMBDA = Math.LN2 / DECAY_HALF_LIFE_MS
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
@@ -52,7 +48,7 @@ function rankRate (sorted: Array<{ rate: number, weight: number }>, total: numbe
     cum += weight
     if (cum >= targetCum) return rate
   }
-  return sorted.at(-1)!.rate // 保底：total > 0 時迴圈必定命中，此行理論上不執行
+  return sorted.at(-1)!.rate
 }
 
 const ZodConfigPeriod = z.record(
@@ -71,7 +67,7 @@ const ZodConfigCurrency = z.object({
 const ZodConfig = z.record(z.string(), ZodConfigCurrency).default({})
 
 const ZodDb = z.object({
-  schema: z.literal(1), // 用來辨識資料結構版本，方便未來升級
+  schema: z.literal(1),
   notified: z.record(
     z.string(),
     z.object({
@@ -90,7 +86,6 @@ export async function main (): Promise<void> {
     return
   }
 
-  // 讀取並驗證設定
   const cfg = ZodConfig.parse(parseYaml(getenv('INPUT_AUTO_RENEW_3', '')))
 
   const db = ZodDb.parse((await bitfinex.v2AuthReadSettings([DB_KEY]).catch(() => ({})))[DB_KEY.slice(4)])
@@ -109,9 +104,7 @@ export async function main (): Promise<void> {
         rateMaxStr: rateStringify(cfg1.rateMax),
       })
 
-      // 修改 autoRenew 的參數
       try {
-        // 取得該貨幣自動出借的設定
         const prevAutoRenew = await bitfinex.v2AuthReadFundingAutoStatus({ currency })
         if (_.isNil(prevAutoRenew)) ymlDump('prevAutoRenew', { status: false })
         else {
@@ -121,116 +114,56 @@ export async function main (): Promise<void> {
           })
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // 定價：Funding Book（P1 聚合精度）為主，Candles + 時間衰減為 fallback
-        //
-        // P1 vs P0：P0 每個 entry 是單一利率的掛單，250 筆只涵蓋最低的 250 個價位。
-        // P1 把相近利率聚合成一個 entry，250 筆涵蓋範圍大幅擴大。
-        //
-        // 不使用 FRR：FRR 存在自我強化迴圈（大量用戶綁定 FRR → FRR 成交回饋進
-        // FRR 計算 → FRR 被自己錨定在高位），不反映真實市場均衡。
-        // ═══════════════════════════════════════════════════════════
-        let bookTargetRate: number
-
-        // ── Primary: Funding Book (P1 精度) ──────────────────────
-        const bookResp = await fetch(
-          `https://api-pub.bitfinex.com/v2/book/f${currency}/P1?len=250`
+        // 定價：24h Funding Candles + 時間衰減
+        // 每根 1 分鐘 K 線的 close 作為代表利率，volume × exp(-λΔt) 作為權重（半衰期 4 小時）
+        const candlesResp = await fetch(
+          `https://api-pub.bitfinex.com/v2/candles/trade:1m:f${currency}/hist?limit=1440&sort=-1`
         )
-        if (!bookResp.ok) {
-          throw new Error(`[${currency}] Funding book fetch failed: HTTP ${bookResp.status}`)
+        if (!candlesResp.ok) {
+          throw new Error(`[${currency}] Candles fetch failed: HTTP ${candlesResp.status}`)
         }
-        const bookRaw: Array<[number, number, number, number]> = await bookResp.json()
-        // Format: [RATE, PERIOD, COUNT, AMOUNT]
-        // amount < 0 → ask side（放貸方掛單，供給）
-        // amount > 0 → bid side（借方掛單，需求）
+        const candlesRaw: Array<[number, number, number, number, number, number]> =
+          await candlesResp.json()
 
-        const askSide = bookRaw
-          .filter(([, , , amount]) => amount < 0)
-          .map(([rate, , , amount]) => ({ rate, weight: Math.abs(amount) }))
+        const now = Date.now()
+        const rateEntries = candlesRaw
+          .filter(([, , , , , vol]) => vol > 0)
+          .map(([mts, , close, , , volume]) => ({
+            rate: close,
+            weight: volume * Math.exp(-DECAY_LAMBDA * (now - mts)),
+          }))
+          .filter(({ weight }) => weight > Number.EPSILON)
           .sort((a, b) => a.rate - b.rate)
 
-        const totalAskAmount = _.sumBy(askSide, 'weight')
+        const totalWeight = _.sumBy(rateEntries, 'weight')
 
-        ymlDump('bookMetrics', {
-          totalEntries: bookRaw.length,
-          askEntries: askSide.length,
-          totalAskAmount: floatFormatDecimal(totalAskAmount, 2),
-          lowestRate: askSide[0] != null ? rateStringify(askSide[0].rate) : null,
-          highestRate: askSide.at(-1) != null ? rateStringify(askSide.at(-1)!.rate) : null,
+        ymlDump('candleMetrics', {
+          rawCount: candlesRaw.length,
+          validEntries: rateEntries.length,
+          totalWeight: floatFormatDecimal(totalWeight, 2),
+          lowestRate: rateEntries[0] != null ? rateStringify(rateEntries[0].rate) : null,
+          highestRate: rateEntries.at(-1) != null ? rateStringify(rateEntries.at(-1)!.rate) : null,
+          decayHalfLifeHours: DECAY_HALF_LIFE_MS / 3_600_000,
         })
 
-        // ── 判斷 book 深度是否足夠 ──────────────────────────────
-        if (askSide.length >= MIN_BOOK_ENTRIES && totalAskAmount > 0) {
-          // ✅ Book 深度足夠 → ask side 累積分佈的 rank 百分位數
-          bookTargetRate = rankRate(askSide, totalAskAmount, cfg1.rank)
-
-          ymlDump('pricing', {
-            method: 'funding_book_P1',
-            rank: cfg1.rank,
-            bookTargetRate,
-            bookTargetRateStr: rateStringify(bookTargetRate),
-          })
-        } else {
-          // ⚠️ Book 深度不足 → fallback: 24h Candles + 時間衰減
-          //
-          // 每根 candle 用 close 作為該分鐘的代表利率（避免 [low,high] 均勻分佈假設），
-          // volume 乘以指數衰減（半衰期 4 小時），讓近期成交權重更高。
-          loggers.log(`[${currency}] Book depth insufficient (${askSide.length} < ${MIN_BOOK_ENTRIES}), falling back to candles.`)
-
-          const candlesResp = await fetch(
-            `https://api-pub.bitfinex.com/v2/candles/trade:1m:f${currency}/hist?limit=720&sort=-1`
-          )
-          if (!candlesResp.ok) {
-            throw new Error(`[${currency}] Candles fetch failed: HTTP ${candlesResp.status}`)
-          }
-          const candlesRaw: Array<[number, number, number, number, number, number]> =
-            await candlesResp.json()
-          // Format: [MTS, OPEN, CLOSE, HIGH, LOW, VOLUME]
-
-          const now = Date.now()
-          const rateEntries = candlesRaw
-            .filter(([, , , , , vol]) => vol > 0)
-            .map(([mts, , close, , , volume]) => ({
-              rate: close,
-              weight: volume * Math.exp(-DECAY_LAMBDA * (now - mts)),
-            }))
-            .filter(({ weight }) => weight > Number.EPSILON)
-            .sort((a, b) => a.rate - b.rate)
-
-          const totalWeight = _.sumBy(rateEntries, 'weight')
-
-          ymlDump('candleMetrics', {
-            rawCount: candlesRaw.length,
-            validEntries: rateEntries.length,
-            totalWeight: floatFormatDecimal(totalWeight, 2),
-            lowestRate: rateEntries[0] != null ? rateStringify(rateEntries[0].rate) : null,
-            highestRate: rateEntries.at(-1) != null ? rateStringify(rateEntries.at(-1)!.rate) : null,
-            decayHalfLifeHours: DECAY_HALF_LIFE_MS / 3_600_000,
-          })
-
-          if (rateEntries.length === 0 || totalWeight <= 0) {
-            throw new SkipError(
-              `[${currency}] Book depth insufficient and no valid candle data.`
-            )
-          }
-
-          bookTargetRate = rankRate(rateEntries, totalWeight, cfg1.rank)
-
-          ymlDump('pricing', {
-            method: 'candle_fallback',
-            reason: `book ask entries ${askSide.length} < ${MIN_BOOK_ENTRIES}`,
-            rank: cfg1.rank,
-            candleEntries: rateEntries.length,
-            bookTargetRate,
-            bookTargetRateStr: rateStringify(bookTargetRate),
-          })
+        if (rateEntries.length === 0 || totalWeight <= 0) {
+          throw new SkipError(`[${currency}] No valid candle data available.`)
         }
+
+        const targetRate = rankRate(rateEntries, totalWeight, cfg1.rank)
+
+        ymlDump('pricing', {
+          method: 'candle_percentile',
+          rank: cfg1.rank,
+          targetRate,
+          targetRateStr: rateStringify(targetRate),
+        })
 
         const newAutoRenew = trace.newAutoRenew = {
           amount: cfg1.amount,
           currency,
-          period: rateToPeriod(cfg1.period, _.clamp(bookTargetRate, cfg1.rateMin, cfg1.rateMax)),
-          rate: _.clamp(bookTargetRate, cfg1.rateMin, cfg1.rateMax),
+          period: rateToPeriod(cfg1.period, _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)),
+          rate: _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax),
         }
         ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate) })
 
@@ -246,7 +179,7 @@ export async function main (): Promise<void> {
             rate: floatFloor8(newAutoRenew.rate * 100), // percentage of rate
             status: 1,
           }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
-          await scheduler.wait(1000) // 等待 1 秒鐘，讓掛單生效
+          await scheduler.wait(1000)
         }
       } catch (err) {
         if (!(err instanceof SkipError)) throw err
@@ -258,7 +191,6 @@ export async function main (): Promise<void> {
         const db1: Record<string, any> = db.notified?.[currency] ?? {}
         const autoRenew = _.pickBy(trace.newAutoRenew, _.isNumber)
 
-        // 並行取得出借中的融資和掛單
         const [creditsRaw, orders] = await Promise.all([
           bitfinex.v2AuthReadFundingCredits({ currency }),
           bitfinex.v2AuthReadFundingOffers({ currency }),
@@ -298,7 +230,6 @@ export async function main (): Promise<void> {
           const res1 = await telegram.sendMessage({ parse_mode: 'MarkdownV2', text: msgText })
           _.set(db, `notified.${currency}`, { msgId: res1.message_id, balance: wallet.balance, creditIds })
         }
-        // 餘額不變 + creditIds 不變 + msgId 存在 → 靜默 edit；否則刪舊、推播新訊息
         const reuseMsgId = _.isNumber(db1.msgId)
           && floatIsEqual(db1.balance, wallet.balance)
           && _.isEqual(db1.creditIds, creditIds)
