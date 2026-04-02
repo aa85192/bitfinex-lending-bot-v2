@@ -150,7 +150,15 @@ export async function main (): Promise<void> {
           throw new SkipError(`[${currency}] No valid candle data.`)
         }
 
-        const targetRate = rankRate(rateEntries, totalWeight, cfg1.rank)
+        // 動態 rank：先算出 FRR 污染比例，再在「正常市場區間」內取 cfg1.rank 百分位
+        // dynamicRank = belowPct + (1 - belowPct) * cfg1.rank
+        // 不論 FRR 污染佔 40% 或 92%，cfg1.rank 始終對應正常市場區間的同一相對位置
+        const frrThreshold = 0.0002 // APR 7.3% 以下視為 FRR 區間
+        const weightBelow = _.sumBy(rateEntries.filter(e => e.rate < frrThreshold), 'weight')
+        const belowPct = weightBelow / totalWeight
+        const dynamicRank = belowPct + (1 - belowPct) * cfg1.rank
+
+        const targetRate = rankRate(rateEntries, totalWeight, dynamicRank)
 
         // === 診斷 log ===
 
@@ -160,16 +168,16 @@ export async function main (): Promise<void> {
         for (const p of percentiles) pctMap[`p${_.round(p * 100)}`] = rateStringify(rankRate(rateEntries, totalWeight, p))
         ymlDump('distribution', pctMap)
 
-        // 2. 利率閾值分析（APR 7.3% 以下視為 FRR 區間）
-        const frrThreshold = 0.0002
-        const weightBelow = _.sumBy(rateEntries.filter(e => e.rate < frrThreshold), 'weight')
-        const weightAbove = _.sumBy(rateEntries.filter(e => e.rate >= frrThreshold), 'weight')
+        // 2. 利率閾值分析 + 動態 rank 計算過程
+        const weightAbove = totalWeight - weightBelow
         ymlDump('thresholdAnalysis', {
           frrThreshold: rateStringify(frrThreshold),
           belowCount: rateEntries.filter(e => e.rate < frrThreshold).length,
           aboveCount: rateEntries.filter(e => e.rate >= frrThreshold).length,
-          belowWeightPct: floatFormatPercent(weightBelow / totalWeight),
+          belowWeightPct: floatFormatPercent(belowPct),
           aboveWeightPct: floatFormatPercent(weightAbove / totalWeight),
+          configRank: cfg1.rank,
+          dynamicRank: _.round(dynamicRank, 4),
         })
 
         // 3. 無衰減分布對比（等權重 = 每根 K 線 weight 1）
