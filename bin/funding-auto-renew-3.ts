@@ -2,7 +2,7 @@
 yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
-1. 取得過去 24 小時的 1 分鐘 Funding Candles
+1. 明確取得「最近 24 小時」的 1 分鐘 Funding Candles
 2. 每根 K 線取 high（最高成交利率），只用指數時間衰減為權重（半衰期 4 小時，不乘 volume）
 3. 在加權累積分佈中以 rank 百分位數找出目標利率
 4. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
@@ -28,6 +28,8 @@ const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
 const DB_KEY = `api:taichunmin_${filename}`
 const RATE_MIN = 0.0001 // APR 3.65%
+const WINDOW_MS = 24 * 60 * 60 * 1000
+const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
 const DECAY_HALF_LIFE_MS = 4 * 60 * 60 * 1000 // 時間衰減半衰期：4 小時
 const DECAY_LAMBDA = Math.LN2 / DECAY_HALF_LIFE_MS
 const bitfinex = new Bitfinex({
@@ -49,6 +51,25 @@ function rankRate (sorted: Array<{ rate: number, weight: number }>, total: numbe
     if (cum >= targetCum) return rate
   }
   return sorted.at(-1)!.rate
+}
+
+function candleRate (c: { high: number }): number {
+  return c.high
+}
+
+function buildRateEntries (
+  candles: Array<{ mts: Date, high: number, volume: number }>,
+  nowTs: number,
+  weighted: boolean,
+): Array<{ rate: number, weight: number }> {
+  return candles
+    .filter(c => c.volume > 0 && c.high > 0)
+    .map(c => ({
+      rate: candleRate(c),
+      weight: weighted ? Math.exp(-DECAY_LAMBDA * (nowTs - +c.mts)) : 1,
+    }))
+    .filter(({ weight }) => weight > Number.EPSILON)
+    .sort((a, b) => a.rate - b.rate)
 }
 
 const ZodConfigPeriod = z.record(
@@ -86,6 +107,12 @@ export async function main (): Promise<void> {
     return
   }
 
+  ymlDump('runtime', {
+    script: import.meta.url,
+    githubSha: process.env.GITHUB_SHA ?? null,
+    node: process.version,
+  })
+
   const cfg = ZodConfig.parse(parseYaml(getenv('INPUT_AUTO_RENEW_3', '')))
 
   const db = ZodDb.parse((await bitfinex.v2AuthReadSettings([DB_KEY]).catch(() => ({})))[DB_KEY.slice(4)])
@@ -114,84 +141,109 @@ export async function main (): Promise<void> {
           })
         }
 
-        // 定價：每根 K 線的 high 為代表利率，只用指數時間衰減為權重（不乘 volume）
-        // high 是該分鐘最高成交利率，跳過 FRR 自動匹配拉低 close 的影響
+        // 明確鎖定最近 24 小時視窗，避免 `limit: 1440` 跨越超過 24h
+        const now = Date.now()
+        const windowStart = new Date(now - WINDOW_MS)
+        const windowEnd = new Date(now)
+
         const candles = await Bitfinex.v2CandlesHist({
           aggregation: 30,
           currency,
-          limit: 1440,
+          limit: 10000,
           periodEnd: 30,
           periodStart: 2,
           sort: BitfinexSort.DESC,
+          start: windowStart,
+          end: windowEnd,
           timeframe: '1m',
         })
 
-        const now = Date.now()
-        const rateEntries = candles
-          .filter(c => c.volume > 0 && c.high > 0)
-          .map(c => ({
-            rate: Math.max(c.open, c.close, c.high, c.low),
-            weight: Math.exp(-DECAY_LAMBDA * (now - +c.mts)),
-          }))
-          .filter(({ weight }) => weight > Number.EPSILON)
-          .sort((a, b) => a.rate - b.rate)
+        const validCandles = candles.filter(c => c.volume > 0 && c.high > 0)
+        const decayedRateEntries = buildRateEntries(validCandles, now, true)
+        const rawRateEntries = buildRateEntries(validCandles, now, false)
+        const totalWeight = _.sumBy(decayedRateEntries, 'weight')
 
-        const totalWeight = _.sumBy(rateEntries, 'weight')
+        const newestCandleTs = validCandles[0] != null ? +validCandles[0].mts : null
+        const oldestCandleTs = validCandles.at(-1) != null ? +validCandles.at(-1)!.mts : null
+        const actualSpanHours = newestCandleTs != null && oldestCandleTs != null
+          ? _.round((newestCandleTs - oldestCandleTs) / 3_600_000, 2)
+          : null
 
         ymlDump('candleMetrics', {
+          requestedWindowStart: dayjs(windowStart).utcOffset(8).format('M/D HH:mm:ss'),
+          requestedWindowEnd: dayjs(windowEnd).utcOffset(8).format('M/D HH:mm:ss'),
           rawCount: candles.length,
-          validEntries: rateEntries.length,
-          lowestRate: rateEntries[0] != null ? rateStringify(rateEntries[0].rate) : null,
-          highestRate: rateEntries.at(-1) != null ? rateStringify(rateEntries.at(-1)!.rate) : null,
+          validEntries: validCandles.length,
+          firstValidCandle: newestCandleTs != null ? dayjs(newestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
+          lastValidCandle: oldestCandleTs != null ? dayjs(oldestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
+          actualSpanHours,
+          missingMinutesApprox: _.max([0, 1440 - validCandles.length]),
+          lowestRate: decayedRateEntries[0] != null ? rateStringify(decayedRateEntries[0].rate) : null,
+          highestRate: decayedRateEntries.at(-1) != null ? rateStringify(decayedRateEntries.at(-1)!.rate) : null,
           decayHalfLifeHours: DECAY_HALF_LIFE_MS / 3_600_000,
         })
 
-        if (rateEntries.length === 0 || totalWeight <= 0) {
-          throw new SkipError(`[${currency}] No valid candle data.`)
+        if (decayedRateEntries.length === 0 || totalWeight <= 0) {
+          throw new SkipError(`[${currency}] No valid candle data in the last 24 hours.`)
         }
 
-        const targetRate = rankRate(rateEntries, totalWeight, cfg1.rank)
+        const effectiveRank = cfg1.rank
+        const targetRate = rankRate(decayedRateEntries, totalWeight, effectiveRank)
 
         // === 診斷 log ===
 
         // 1. 百分位數分布（有衰減），用 rankRate 保證單調遞增
         const percentiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99]
         const pctMap: Record<string, string> = {}
-        for (const p of percentiles) pctMap[`p${_.round(p * 100)}`] = rateStringify(rankRate(rateEntries, totalWeight, p))
+        for (const p of percentiles) {
+          pctMap[`p${_.round(p * 100)}`] = rateStringify(rankRate(decayedRateEntries, totalWeight, p))
+        }
         ymlDump('distribution', pctMap)
 
         // 2. 利率閾值分析（APR 7.3% 以下視為 FRR 區間）
         const frrThreshold = 0.0002
-        const wBelow = _.sumBy(rateEntries.filter(e => e.rate < frrThreshold), 'weight')
+        const belowEntries = decayedRateEntries.filter(e => e.rate < frrThreshold)
+        const wBelow = _.sumBy(belowEntries, 'weight')
         ymlDump('thresholdAnalysis', {
           frrThreshold: rateStringify(frrThreshold),
-          belowCount: rateEntries.filter(e => e.rate < frrThreshold).length,
-          aboveCount: rateEntries.filter(e => e.rate >= frrThreshold).length,
+          belowCount: belowEntries.length,
+          aboveCount: decayedRateEntries.length - belowEntries.length,
           belowWeightPct: floatFormatPercent(wBelow / totalWeight),
           aboveWeightPct: floatFormatPercent((totalWeight - wBelow) / totalWeight),
+          configRank: cfg1.rank,
+          effectiveRank,
         })
 
         // 3. 無衰減分布對比（等權重 = 每根 K 線 weight 1）
         const rawPctMap: Record<string, string> = {}
-        for (const p of percentiles) rawPctMap[`p${_.round(p * 100)}`] = rateStringify(rankRate(rateEntries, rateEntries.length, p))
+        for (const p of percentiles) {
+          rawPctMap[`p${_.round(p * 100)}`] = rateStringify(rankRate(rawRateEntries, rawRateEntries.length, p))
+        }
         ymlDump('distributionNoDecay', rawPctMap)
 
-        // 4. 最近 2 小時 vs 全天
-        const recentCutoff = now - 2 * 60 * 60 * 1000
-        const recentCandles = candles.filter(c => +c.mts >= recentCutoff)
-        const olderCandles = candles.filter(c => +c.mts < recentCutoff)
-        const avgHigh = (list: typeof candles): number => {
-          const highs = list.filter(c => c.volume > 0 && c.high > 0).map(c => Math.max(c.open, c.close, c.high, c.low))
+        // 4. 最近 2 小時 vs 之前 22 小時（都限定在最近 24 小時視窗內）
+        const recentCutoff = now - RECENT_WINDOW_MS
+        const recentCandles = validCandles.filter(c => +c.mts >= recentCutoff)
+        const olderCandles = validCandles.filter(c => +c.mts < recentCutoff)
+        const avgHigh = (list: Array<{ high: number }>): number => {
+          const highs = list.map(c => candleRate(c))
           return highs.length > 0 ? _.mean(highs) : 0
         }
         ymlDump('recentVsOlder', {
-          recent2h: { count: recentCandles.length, avgHigh: rateStringify(avgHigh(recentCandles)), totalVol: floatFormatDecimal(_.sumBy(recentCandles.filter(c => c.volume > 0), 'volume'), 2) },
-          older22h: { count: olderCandles.length, avgHigh: rateStringify(avgHigh(olderCandles)), totalVol: floatFormatDecimal(_.sumBy(olderCandles.filter(c => c.volume > 0), 'volume'), 2) },
+          recent2h: {
+            count: recentCandles.length,
+            avgHigh: rateStringify(avgHigh(recentCandles)),
+            totalVol: floatFormatDecimal(_.sumBy(recentCandles, 'volume'), 2),
+          },
+          older22h: {
+            count: olderCandles.length,
+            avgHigh: rateStringify(avgHigh(olderCandles)),
+            totalVol: floatFormatDecimal(_.sumBy(olderCandles, 'volume'), 2),
+          },
         })
 
         // 5. High vs Close 差距分析
-        const highCloseGaps = candles
-          .filter(c => c.volume > 0 && c.high > 0)
+        const highCloseGaps = validCandles
           .map(c => ({ gapPct: (c.high - c.close) / c.high, volume: c.volume }))
         const significantGaps = highCloseGaps.filter(g => g.gapPct > 0.3)
         ymlDump('highCloseAnalysis', {
@@ -203,13 +255,12 @@ export async function main (): Promise<void> {
           normalGapAvgVol: floatFormatDecimal(_.meanBy(highCloseGaps.filter(g => g.gapPct <= 0.3), 'volume') ?? 0, 2),
         })
 
-        // 6. 每小時 high 均值趨勢
+        // 6. 每小時 high 均值趨勢（只看最近 24 小時有效 candles）
         const hourlyBuckets: Record<number, { sumRate: number, count: number }> = {}
-        for (const c of candles) {
-          if (c.volume <= 0 || c.high <= 0) continue
+        for (const c of validCandles) {
           const hour = new Date(+c.mts).getUTCHours()
           if (!hourlyBuckets[hour]) hourlyBuckets[hour] = { sumRate: 0, count: 0 }
-          hourlyBuckets[hour].sumRate += Math.max(c.open, c.close, c.high, c.low)
+          hourlyBuckets[hour].sumRate += candleRate(c)
           hourlyBuckets[hour].count++
         }
         const hourlyRates: Record<string, string> = {}
@@ -219,12 +270,13 @@ export async function main (): Promise<void> {
         }
         ymlDump('hourlyRates', hourlyRates)
 
-
         ymlDump('pricing', {
           method: 'candle_high_decay',
           rank: cfg1.rank,
+          effectiveRank,
           targetRate,
           targetRateStr: rateStringify(targetRate),
+          pAtEffectiveRank: rateStringify(rankRate(decayedRateEntries, totalWeight, effectiveRank)),
         })
 
         const newAutoRenew = trace.newAutoRenew = {
@@ -244,7 +296,7 @@ export async function main (): Promise<void> {
           await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
           await bitfinex.v2AuthWriteFundingAuto({
             ...newAutoRenew,
-            rate: floatFloor8(newAutoRenew.rate * 100), // percentage of rate
+            rate: floatFloor8(newAutoRenew.rate * 100), // API 要的是百分比
             status: 1,
           }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
           await scheduler.wait(1000)
