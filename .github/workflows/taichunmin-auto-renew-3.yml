@@ -50,7 +50,7 @@ jobs:
               amount: 0
               rank: 0.6
               rateMax: 0.001
-              rateMin: 0.0003
+              rateMin: 0.00014
               period:
                 3: 0.00027397
                 4: 0.00030822
@@ -84,7 +84,7 @@ jobs:
               amount: 0
               rank: 0.6
               rateMax: 0.001
-              rateMin: 0.0003
+              rateMin: 0.00014
               period:
                 3: 0.00027397
                 4: 0.00030822

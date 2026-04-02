@@ -150,15 +150,7 @@ export async function main (): Promise<void> {
           throw new SkipError(`[${currency}] No valid candle data.`)
         }
 
-        // 動態 rank：先算出 FRR 污染比例，再在「正常市場區間」內取 cfg1.rank 百分位
-        // dynamicRank = belowPct + (1 - belowPct) * cfg1.rank
-        // 不論 FRR 污染佔 40% 或 92%，cfg1.rank 始終對應正常市場區間的同一相對位置
-        const frrThreshold = 0.0002 // APR 7.3% 以下視為 FRR 區間
-        const weightBelow = _.sumBy(rateEntries.filter(e => e.rate < frrThreshold), 'weight')
-        const belowPct = weightBelow / totalWeight
-        const dynamicRank = belowPct + (1 - belowPct) * cfg1.rank
-
-        const targetRate = rankRate(rateEntries, totalWeight, dynamicRank)
+        const targetRate = rankRate(rateEntries, totalWeight, cfg1.rank)
 
         // === 診斷 log ===
 
@@ -168,16 +160,15 @@ export async function main (): Promise<void> {
         for (const p of percentiles) pctMap[`p${_.round(p * 100)}`] = rateStringify(rankRate(rateEntries, totalWeight, p))
         ymlDump('distribution', pctMap)
 
-        // 2. 利率閾值分析 + 動態 rank 計算過程
-        const weightAbove = totalWeight - weightBelow
+        // 2. 利率閾值分析（APR 7.3% 以下視為 FRR 區間）
+        const frrThreshold = 0.0002
+        const wBelow = _.sumBy(rateEntries.filter(e => e.rate < frrThreshold), 'weight')
         ymlDump('thresholdAnalysis', {
           frrThreshold: rateStringify(frrThreshold),
           belowCount: rateEntries.filter(e => e.rate < frrThreshold).length,
           aboveCount: rateEntries.filter(e => e.rate >= frrThreshold).length,
-          belowWeightPct: floatFormatPercent(belowPct),
-          aboveWeightPct: floatFormatPercent(weightAbove / totalWeight),
-          configRank: cfg1.rank,
-          dynamicRank: _.round(dynamicRank, 4),
+          belowWeightPct: floatFormatPercent(wBelow / totalWeight),
+          aboveWeightPct: floatFormatPercent((totalWeight - wBelow) / totalWeight),
         })
 
         // 3. 無衰減分布對比（等權重 = 每根 K 線 weight 1）
@@ -228,142 +219,6 @@ export async function main (): Promise<void> {
         }
         ymlDump('hourlyRates', hourlyRates)
 
-        // === 市場資料完整快照 ===
-
-        // 1. Funding Book（P0 最高精度，ask + bid 全部）
-        const bookP0Resp = await fetch(
-          `https://api-pub.bitfinex.com/v2/book/f${currency}/P0?len=250`
-        )
-        const bookP0Raw: number[][] = await bookP0Resp.json()
-        const askSide = bookP0Raw
-          .filter(([, , , amount]) => amount > 0)
-          .map(([rate, period, count, amount]) => ({ rate, period, count, amount }))
-          .sort((a, b) => a.rate - b.rate)
-        const bidSide = bookP0Raw
-          .filter(([, , , amount]) => amount < 0)
-          .map(([rate, period, count, amount]) => ({ rate, period, count, amount: Math.abs(amount) }))
-          .sort((a, b) => b.rate - a.rate)
-
-        ymlDump('bookAskSide', {
-          description: 'Lenders offering funds (sorted low→high rate)',
-          totalEntries: askSide.length,
-          totalAmount: floatFormatDecimal(_.sumBy(askSide, 'amount'), 2),
-          rateRange: askSide.length > 0 ? {
-            lowest: rateStringify(askSide[0].rate),
-            highest: rateStringify(askSide[askSide.length - 1].rate),
-          } : null,
-          first10: askSide.slice(0, 10).map(e => ({
-            rate: rateStringify(e.rate),
-            period: e.period,
-            count: e.count,
-            amount: floatFormatDecimal(e.amount, 2),
-          })),
-          last10: askSide.slice(-10).map(e => ({
-            rate: rateStringify(e.rate),
-            period: e.period,
-            count: e.count,
-            amount: floatFormatDecimal(e.amount, 2),
-          })),
-        })
-
-        ymlDump('bookBidSide', {
-          description: 'Borrowers requesting funds (sorted high→low rate)',
-          totalEntries: bidSide.length,
-          totalAmount: floatFormatDecimal(_.sumBy(bidSide, 'amount'), 2),
-          rateRange: bidSide.length > 0 ? {
-            lowest: rateStringify(bidSide[bidSide.length - 1].rate),
-            highest: rateStringify(bidSide[0].rate),
-          } : null,
-          first10: bidSide.slice(0, 10).map(e => ({
-            rate: rateStringify(e.rate),
-            period: e.period,
-            count: e.count,
-            amount: floatFormatDecimal(e.amount, 2),
-          })),
-          last10: bidSide.slice(-10).map(e => ({
-            rate: rateStringify(e.rate),
-            period: e.period,
-            count: e.count,
-            amount: floatFormatDecimal(e.amount, 2),
-          })),
-        })
-
-        // 2. Funding Ticker（即時最佳報價）
-        const tickerResp = await fetch(
-          `https://api-pub.bitfinex.com/v2/ticker/f${currency}`
-        )
-        const ticker: number[] = await tickerResp.json()
-        ymlDump('fundingTicker', {
-          frr: rateStringify(ticker[0]),
-          bestBidRate: rateStringify(ticker[1]),
-          bestBidPeriod: ticker[3],
-          bestBidAmount: floatFormatDecimal(Math.abs(ticker[2]), 2),
-          bestAskRate: rateStringify(ticker[4]),
-          bestAskPeriod: ticker[6],
-          bestAskAmount: floatFormatDecimal(ticker[5], 2),
-          dailyChange: floatFormatPercent(ticker[8]),
-          lastRate: rateStringify(ticker[9]),
-          volume24h: floatFormatDecimal(ticker[10], 2),
-          high24h: rateStringify(ticker[11]),
-          low24h: rateStringify(ticker[12]),
-        })
-
-        // 3. Public Trades（最近 100 筆成交）
-        const tradesResp = await fetch(
-          `https://api-pub.bitfinex.com/v2/trades/f${currency}/hist?limit=100&sort=-1`
-        )
-        const tradesRaw: number[][] = await tradesResp.json()
-        const trades = tradesRaw.map(([id, mts, amount, rate, period]) => ({ id, mts, amount, rate, period }))
-        const tradeRates = trades.map(t => t.rate)
-        const tradeAmounts = trades.map(t => Math.abs(t.amount))
-        ymlDump('recentTrades', {
-          count: trades.length,
-          rateRange: {
-            min: rateStringify(_.min(tradeRates)!),
-            max: rateStringify(_.max(tradeRates)!),
-            median: rateStringify(_.sortBy(tradeRates)[Math.floor(tradeRates.length / 2)]),
-          },
-          amountRange: {
-            min: floatFormatDecimal(_.min(tradeAmounts)!, 2),
-            max: floatFormatDecimal(_.max(tradeAmounts)!, 2),
-            median: floatFormatDecimal(_.sortBy(tradeAmounts)[Math.floor(tradeAmounts.length / 2)], 2),
-          },
-          newest5: trades.slice(0, 5).map(t => ({
-            time: dayjs(t.mts).utcOffset(8).format('HH:mm:ss'),
-            rate: rateStringify(t.rate),
-            amount: floatFormatDecimal(t.amount, 2),
-            period: t.period,
-          })),
-          oldest5: trades.slice(-5).map(t => ({
-            time: dayjs(t.mts).utcOffset(8).format('HH:mm:ss'),
-            rate: rateStringify(t.rate),
-            amount: floatFormatDecimal(t.amount, 2),
-            period: t.period,
-          })),
-          rateDistribution: {
-            below5pct: trades.filter(t => t.rate < 0.000137).length,
-            '5to10pct': trades.filter(t => t.rate >= 0.000137 && t.rate < 0.000274).length,
-            '10to15pct': trades.filter(t => t.rate >= 0.000274 && t.rate < 0.000411).length,
-            '15to20pct': trades.filter(t => t.rate >= 0.000411 && t.rate < 0.000548).length,
-            above20pct: trades.filter(t => t.rate >= 0.000548).length,
-          },
-        })
-
-        // 4. Funding Stats（最近 24 筆，每小時一筆）
-        const statsResp = await fetch(
-          `https://api-pub.bitfinex.com/v2/funding/stats/f${currency}/hist?limit=24`
-        )
-        const statsRaw: number[][] = await statsResp.json()
-        ymlDump('fundingStats24h', statsRaw.slice(0, 6).map(
-          ([mts, , , frr, avgPeriod, , , totalProvided, totalUsed]) => ({
-            time: dayjs(mts).utcOffset(8).format('M/D HH:mm'),
-            frr: rateStringify(frr),
-            avgPeriod: _.round(avgPeriod, 1),
-            totalProvided: floatFormatDecimal(totalProvided, 0),
-            totalUsed: floatFormatDecimal(totalUsed, 0),
-            utilizationPct: floatFormatPercent(totalUsed / totalProvided),
-          })
-        ))
 
         ymlDump('pricing', {
           method: 'candle_high_decay',
