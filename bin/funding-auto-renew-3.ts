@@ -108,7 +108,7 @@ const ZodConfigPeriod = z.record(
 
 const ZodConfigCurrency = z.object({
   amount: z.coerce.number().min(0).default(0),
-  rank: z.coerce.number().min(0).max(1).default(0.5),
+  rank: z.coerce.number().min(0).max(1).default(0.8),
   rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
   rateMin: z.coerce.number().min(RATE_MIN).default(0.0002),
   period: ZodConfigPeriod,
