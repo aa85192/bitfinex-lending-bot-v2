@@ -2,7 +2,7 @@
 yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
-1. 明確取得「最近 24 小時」的 1 分鐘 Funding Candles
+1. 明確取得「最近 24 小時」的 30 分鐘 Funding Candles
 2. 每根 K 線取 high（最高成交利率），只用指數時間衰減為權重（半衰期 4 小時，不乘 volume）
 3. 在加權累積分佈中以 rank 百分位數找出目標利率
 4. 夾住在 rateMin ~ rateMax 之間後，設定自動出借
@@ -155,7 +155,7 @@ export async function main (): Promise<void> {
           sort: BitfinexSort.DESC,
           start: windowStart,
           end: windowEnd,
-          timeframe: '1m',
+          timeframe: '30m',
         })
 
         const validCandles = candles.filter(c => c.volume > 0 && c.high > 0)
@@ -177,7 +177,7 @@ export async function main (): Promise<void> {
           firstValidCandle: newestCandleTs != null ? dayjs(newestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
           lastValidCandle: oldestCandleTs != null ? dayjs(oldestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
           actualSpanHours,
-          missingMinutesApprox: _.max([0, 1440 - validCandles.length]),
+          missing30mCandlesApprox: _.max([0, 48 - validCandles.length]),
           lowestRate: decayedRateEntries[0] != null ? rateStringify(decayedRateEntries[0].rate) : null,
           highestRate: decayedRateEntries.at(-1) != null ? rateStringify(decayedRateEntries.at(-1)!.rate) : null,
           decayHalfLifeHours: DECAY_HALF_LIFE_MS / 3_600_000,
