@@ -1,4 +1,4 @@
-name: 'taichunmin auto-renew-3: fUSD + fUST'
+name: 'WTKuo auto-renew-3: fUSD + fUST'
 
 on:
   workflow_dispatch:
