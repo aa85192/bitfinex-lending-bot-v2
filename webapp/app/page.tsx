@@ -76,6 +76,13 @@ export default function StatusPage () {
   useEffect(() => {
     loadStatus(currency)
     loadHistory(currency)
+
+    // Auto-refresh current status every 60 seconds
+    const refreshInterval = setInterval(() => {
+      loadStatus(currency)
+    }, 60_000)
+
+    return () => clearInterval(refreshInterval)
   }, [currency, loadStatus, loadHistory])
 
   const handleCurrencyChange = (c: string) => {

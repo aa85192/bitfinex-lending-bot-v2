@@ -32,17 +32,27 @@ export default function HistoryPage() {
   const [endDate, setEndDate] = useState(toDateStr(new Date()))
 
   useEffect(() => {
-    setLoading(true)
-    setError(null)
-    setAllData([])
-    fetch(`${BASE_URL}/${currency}.json`)
-      .then(r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        return r.json()
-      })
-      .then((data: HistoryRecord[]) => setAllData(data))
-      .catch(e => setError(e.message ?? '載入失敗'))
-      .finally(() => setLoading(false))
+    const loadData = async () => {
+      setLoading(true)
+      setError(null)
+      setAllData([])
+      try {
+        const res = await fetch(`${BASE_URL}/${currency}.json`)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        setAllData(await res.json())
+      } catch (e: any) {
+        setError(e.message ?? '載入失敗')
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    loadData()
+
+    // Auto-refresh history data every 5 minutes
+    const refreshInterval = setInterval(loadData, 300_000)
+
+    return () => clearInterval(refreshInterval)
   }, [currency])
 
   // APY summary — from latest record
