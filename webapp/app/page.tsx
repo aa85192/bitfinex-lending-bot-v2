@@ -5,8 +5,11 @@ import CurrencyTabs from '@/components/CurrencyTabs'
 import MetricCard from '@/components/MetricCard'
 import AutoRenewCard from '@/components/AutoRenewCard'
 import CreditsTable from '@/components/CreditsTable'
+import LendingCharts from '@/components/LendingCharts'
+import type { HistoryRecord } from '@/components/HistoryTable'
 
-const DATA_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/current-status'
+const STATUS_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/current-status'
+const HISTORY_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/funding-statistics-1'
 
 export interface StatusData {
   wallet: { balance: number }
@@ -21,9 +24,9 @@ function pct (part: number, total: number) {
   return `${((part / total) * 100).toFixed(1)}%`
 }
 
-function SkeletonCard () {
+function SkeletonCard ({ color = '' }: { color?: string }) {
   return (
-    <div className="card">
+    <div className={`card ${color}`}>
       <div className="skeleton h-4 w-20 mb-3" />
       <div className="skeleton h-9 w-32" />
       <div className="skeleton h-3 w-16 mt-2" />
@@ -37,11 +40,15 @@ export default function StatusPage () {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const load = useCallback(async (cur: string) => {
+  const [history, setHistory] = useState<HistoryRecord[]>([])
+  const [historyLoading, setHistoryLoading] = useState(true)
+
+  // Fetch current status
+  const loadStatus = useCallback(async (cur: string) => {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`${DATA_BASE}/${cur}.json`, { cache: 'no-store' })
+      const res = await fetch(`${STATUS_BASE}/${cur}.json`, { cache: 'no-store' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setData(await res.json())
     } catch (e: any) {
@@ -51,9 +58,25 @@ export default function StatusPage () {
     }
   }, [])
 
+  // Fetch history data for charts
+  const loadHistory = useCallback(async (cur: string) => {
+    setHistoryLoading(true)
+    setHistory([])
+    try {
+      const res = await fetch(`${HISTORY_BASE}/${cur}.json`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setHistory(await res.json())
+    } catch {
+      // silently ignore — charts will show empty state
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
-    load(currency)
-  }, [currency, load])
+    loadStatus(currency)
+    loadHistory(currency)
+  }, [currency, loadStatus, loadHistory])
 
   const handleCurrencyChange = (c: string) => {
     setCurrency(c)
@@ -84,7 +107,7 @@ export default function StatusPage () {
         <div className="flex items-center gap-3">
           {!loading && (
             <button
-              onClick={() => load(currency)}
+              onClick={() => loadStatus(currency)}
               className="text-sm text-gray-400 hover:text-emerald-600 transition-colors"
               title="重新整理"
             >
@@ -109,24 +132,26 @@ export default function StatusPage () {
       {/* Metric cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {loading ? (
-          <><SkeletonCard /><SkeletonCard /><SkeletonCard /></>
+          <><SkeletonCard /><SkeletonCard color="bg-emerald-50/60" /><SkeletonCard color="bg-sky-50/60" /></>
         ) : (
           <>
             <MetricCard
               label="投資總額"
               value={balance.toFixed(2)}
               subtitle={currency}
+              color="neutral"
             />
             <MetricCard
               label="已借出"
               value={creditsSum.toFixed(2)}
               subtitle={`${pct(creditsSum, balance)} · ${currency}`}
-              accent
+              color="emerald"
             />
             <MetricCard
               label="掛單中"
               value={offersSum.toFixed(2)}
               subtitle={`${pct(offersSum, balance)} · ${currency}`}
+              color="sky"
             />
           </>
         )}
@@ -167,6 +192,16 @@ export default function StatusPage () {
             <CreditsTable credits={data?.credits ?? []} />
           )}
         </div>
+      </div>
+
+      {/* ── Charts section ── */}
+      <div>
+        <h2 className="text-lg font-semibold text-gray-900 mb-4">收益圖表</h2>
+        <LendingCharts
+          records={history}
+          loading={historyLoading}
+          currency={currency}
+        />
       </div>
     </div>
   )
