@@ -3,7 +3,7 @@ import './globals.css'
 import Nav from '@/components/Nav'
 
 export const metadata: Metadata = {
-  title: '放貸管理',
+  title: 'WTK的放貸管理',
   description: 'Bitfinex 放貸收益管理儀表板',
 }
 
