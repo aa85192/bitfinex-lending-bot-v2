@@ -1,4 +1,8 @@
-import type { AutoRenewInfo } from '@/lib/bitfinex-server'
+interface AutoRenewInfo {
+  rate: number
+  period: number
+  amount: number
+}
 
 function fmt(n: number, dp: number) {
   return n.toFixed(dp)

@@ -5,14 +5,23 @@ import CurrencyTabs from '@/components/CurrencyTabs'
 import MetricCard from '@/components/MetricCard'
 import AutoRenewCard from '@/components/AutoRenewCard'
 import CreditsTable from '@/components/CreditsTable'
-import type { StatusResponse } from '@/lib/bitfinex-server'
 
-function pct(part: number, total: number) {
-  if (total <= 0) return '0.00%'
+const DATA_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/current-status'
+
+export interface StatusData {
+  wallet: { balance: number }
+  credits: Array<{ id: number; amount: number; rate: number; period: number; mtsOpening: string; mtsLastPayout: string | null }>
+  offers: Array<{ id: number; amount: number; rate: number; period: number }>
+  autoRenew: { rate: number; period: number; amount: number } | null
+  updatedAt: string
+}
+
+function pct (part: number, total: number) {
+  if (total <= 0) return '0.0%'
   return `${((part / total) * 100).toFixed(1)}%`
 }
 
-function SkeletonCard() {
+function SkeletonCard () {
   return (
     <div className="card">
       <div className="skeleton h-4 w-20 mb-3" />
@@ -22,35 +31,19 @@ function SkeletonCard() {
   )
 }
 
-function ErrorBanner({ message }: { message: string }) {
-  return (
-    <div className="rounded-xl bg-red-50 border border-red-100 px-4 py-3 text-sm text-red-600">
-      {message}
-    </div>
-  )
-}
-
-export default function StatusPage() {
+export default function StatusPage () {
   const [currency, setCurrency] = useState('USD')
-  const [data, setData] = useState<StatusResponse | null>(null)
+  const [data, setData] = useState<StatusData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [updatedAt, setUpdatedAt] = useState<string | null>(null)
 
   const load = useCallback(async (cur: string) => {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`/api/status?currency=${cur}`)
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? `HTTP ${res.status}`)
-      }
-      const json: StatusResponse = await res.json()
-      setData(json)
-      setUpdatedAt(new Date(json.updatedAt).toLocaleTimeString('zh-Hant', {
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-      }))
+      const res = await fetch(`${DATA_BASE}/${cur}.json`, { cache: 'no-store' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setData(await res.json())
     } catch (e: any) {
       setError(e.message ?? '取得資料失敗')
     } finally {
@@ -60,8 +53,6 @@ export default function StatusPage() {
 
   useEffect(() => {
     load(currency)
-    const id = setInterval(() => load(currency), 60_000)
-    return () => clearInterval(id)
   }, [currency, load])
 
   const handleCurrencyChange = (c: string) => {
@@ -73,14 +64,21 @@ export default function StatusPage() {
   const offersSum = data?.offers.reduce((s, o) => s + o.amount, 0) ?? 0
   const balance = data?.wallet.balance ?? 0
 
+  const updatedAt = data?.updatedAt
+    ? new Date(data.updatedAt).toLocaleString('zh-Hant', {
+        month: 'numeric', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      })
+    : null
+
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-gray-900">即時狀態</h1>
           {updatedAt && !loading && (
-            <p className="text-sm text-gray-400 mt-0.5">最後更新：{updatedAt}</p>
+            <p className="text-sm text-gray-400 mt-0.5">資料更新於 {updatedAt}</p>
           )}
         </div>
         <div className="flex items-center gap-3">
@@ -99,32 +97,35 @@ export default function StatusPage() {
         </div>
       </div>
 
-      {error && <ErrorBanner message={error} />}
+      {error && (
+        <div className="rounded-xl bg-red-50 border border-red-100 px-4 py-3 text-sm text-red-600">
+          {error}
+          {error.includes('404') && (
+            <span className="ml-1 text-red-400">（資料尚未產生，請等待 GitHub Actions 執行後再重試）</span>
+          )}
+        </div>
+      )}
 
       {/* Metric cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {loading ? (
-          <>
-            <SkeletonCard />
-            <SkeletonCard />
-            <SkeletonCard />
-          </>
+          <><SkeletonCard /><SkeletonCard /><SkeletonCard /></>
         ) : (
           <>
             <MetricCard
               label="投資總額"
-              value={`${balance.toFixed(2)}`}
+              value={balance.toFixed(2)}
               subtitle={currency}
             />
             <MetricCard
               label="已借出"
-              value={`${creditsSum.toFixed(2)}`}
+              value={creditsSum.toFixed(2)}
               subtitle={`${pct(creditsSum, balance)} · ${currency}`}
               accent
             />
             <MetricCard
               label="掛單中"
-              value={`${offersSum.toFixed(2)}`}
+              value={offersSum.toFixed(2)}
               subtitle={`${pct(offersSum, balance)} · ${currency}`}
             />
           </>
@@ -137,7 +138,7 @@ export default function StatusPage() {
           {loading ? (
             <div className="card space-y-3">
               <div className="skeleton h-4 w-24 mb-2" />
-              {[1,2,3,4].map(i => (
+              {[1, 2, 3, 4].map(i => (
                 <div key={i} className="flex justify-between">
                   <div className="skeleton h-4 w-16" />
                   <div className="skeleton h-4 w-20" />
@@ -154,15 +155,13 @@ export default function StatusPage() {
               <div className="px-6 py-4 border-b border-gray-100">
                 <div className="skeleton h-4 w-20" />
               </div>
-              <div className="divide-y divide-gray-50">
-                {[1,2,3].map(i => (
-                  <div key={i} className="px-6 py-4 flex gap-4">
-                    <div className="skeleton h-4 w-24" />
-                    <div className="skeleton h-4 w-16 ml-auto" />
-                    <div className="skeleton h-4 w-16" />
-                  </div>
-                ))}
-              </div>
+              {[1, 2, 3].map(i => (
+                <div key={i} className="px-6 py-4 flex gap-4">
+                  <div className="skeleton h-4 w-24" />
+                  <div className="skeleton h-4 w-16 ml-auto" />
+                  <div className="skeleton h-4 w-16" />
+                </div>
+              ))}
             </div>
           ) : (
             <CreditsTable credits={data?.credits ?? []} />

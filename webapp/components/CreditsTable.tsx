@@ -1,4 +1,11 @@
-import type { CreditInfo } from '@/lib/bitfinex-server'
+interface CreditInfo {
+  id: number
+  amount: number
+  rate: number
+  period: number
+  mtsOpening: string
+  mtsLastPayout: string | null
+}
 
 function fmtDate(iso: string) {
   return iso.slice(0, 10)

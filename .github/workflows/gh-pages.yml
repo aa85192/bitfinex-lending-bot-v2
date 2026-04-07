@@ -6,8 +6,8 @@ on:
     branches: [ master ]
   schedule:
     # timezone: UTC
-    # 避開整點時間，因為有可能會有時間上的延誤
-    - cron: '45 0-3 * * *'
+    # 每 30 分鐘更新一次（即時狀態資料）
+    - cron: '5,35 * * * *'
 
 jobs:
   build:
@@ -29,17 +29,42 @@ jobs:
           echo 'secrets=${{ toJSON(secrets) }}'
           echo 'steps=${{ toJSON(steps) }}'
           echo 'vars=${{ toJSON(vars) }}'
+
       - uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
           cache: 'yarn'
-      - name: install and build
-        run: |
-          set -ex
-          yarn
-          INPUT_CURRENCYS=USD yarn tsx ./bin/funding-statistics-1.ts
+
+      - name: Install dependencies (yarn)
+        run: yarn
+
+      - name: Export current status (USD + UST)
+        run: INPUT_CURRENCYS=USD,UST yarn tsx ./bin/export-current-status.ts
+
+      - name: Generate funding statistics (USD)
+        run: INPUT_CURRENCYS=USD yarn tsx ./bin/funding-statistics-1.ts
+
+      - name: Setup Node.js for webapp (npm)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+          cache-dependency-path: webapp/package-lock.json
+
+      - name: Install webapp dependencies
+        run: npm ci
+        working-directory: webapp
+
+      - name: Build webapp (static export)
+        run: npm run build
+        working-directory: webapp
+
+      - name: Copy webapp output into dist/
+        run: cp -r webapp/out/. dist/
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -53,6 +78,7 @@ jobs:
       id-token: write
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
