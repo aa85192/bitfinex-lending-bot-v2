@@ -1,0 +1,10 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "installCommand": "npm install",
+  "env": {
+    "BITFINEX_API_KEY": "@bitfinex_api_key",
+    "BITFINEX_API_SECRET": "@bitfinex_api_secret"
+  }
+}
