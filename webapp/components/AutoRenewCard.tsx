@@ -11,12 +11,25 @@ function fmt(n: number, dp: number) {
 interface AutoRenewCardProps {
   autoRenew: AutoRenewInfo | null
   currency: string
+  updatedAt?: string
 }
 
-export default function AutoRenewCard({ autoRenew, currency }: AutoRenewCardProps) {
+export default function AutoRenewCard({ autoRenew, currency, updatedAt }: AutoRenewCardProps) {
+  const formattedTime = updatedAt
+    ? new Date(updatedAt).toLocaleString('zh-Hant', {
+        month: 'numeric', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      })
+    : null
+
   return (
     <div className="card">
-      <p className="text-sm font-medium text-gray-700 mb-4">自動掛單設定</p>
+      <div className="flex items-center justify-between mb-4">
+        <p className="text-sm font-medium text-gray-700">自動掛單設定</p>
+        {formattedTime && (
+          <p className="text-xs text-gray-400">更新於 {formattedTime}</p>
+        )}
+      </div>
       {autoRenew ? (
         <div className="space-y-3">
           <Row label="幣種" value={currency} />

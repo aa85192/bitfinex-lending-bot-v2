@@ -178,7 +178,7 @@ export default function StatusPage () {
               ))}
             </div>
           ) : (
-            <AutoRenewCard autoRenew={data?.autoRenew ?? null} currency={currency} />
+            <AutoRenewCard autoRenew={data?.autoRenew ?? null} currency={currency} updatedAt={data?.updatedAt} />
           )}
         </div>
         <div className="lg:col-span-3">
