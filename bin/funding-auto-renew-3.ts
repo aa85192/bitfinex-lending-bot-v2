@@ -27,7 +27,7 @@ import * as telegram from '../lib/telegram.mjs'
 
 const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
-const DB_KEY = `api:taichunmin_${filename}`
+const DB_KEY = `api:wtkuo_${filename}`
 const RATE_MIN = 0.0001 // APR 3.65%
 const WINDOW_MS = 24 * 60 * 60 * 1000
 const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
