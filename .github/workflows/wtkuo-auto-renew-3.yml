@@ -10,6 +10,8 @@ on:
 env:
   BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
   BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
   TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -43,77 +45,6 @@ jobs:
           node-version: lts/*
           cache: 'yarn'
       - name: Install dependencies, eslint, and run
-        env:
-          # https://docs.google.com/spreadsheets/d/1eJSlFDx5iFM_rMM9mFiPO16x1VhyDReAOeCyLT-bdRA/edit#gid=1058478097
-          INPUT_AUTO_RENEW_3: |
-            USD:
-              amount: 0
-              rank: 0.85
-              rateMax: 0.001
-              rateMin: 0.0001918
-              period:
-                3: 0.00027397
-                4: 0.00030822
-                5: 0.00034247
-                6: 0.00037671
-                7: 0.00041096
-                8: 0.00043053
-                9: 0.00045010
-                10: 0.00046967
-                11: 0.00048924
-                12: 0.00050881
-                13: 0.00052838
-                14: 0.00054795
-                15: 0.00056751
-                16: 0.00058708
-                17: 0.00060665
-                18: 0.00062622
-                19: 0.00064579
-                20: 0.00066536
-                21: 0.00068493
-                22: 0.00070015
-                23: 0.00071537
-                24: 0.00073059
-                25: 0.00074581
-                26: 0.00076104
-                27: 0.00077626
-                28: 0.00079148
-                29: 0.00080670
-                30: 0.00082192
-            UST:
-              amount: 0
-              rank: 0.8
-              rateMax: 0.001
-              rateMin: 0.0001918
-              period:
-                3: 0.00027397
-                4: 0.00030822
-                5: 0.00034247
-                6: 0.00037671
-                7: 0.00041096
-                8: 0.00043053
-                9: 0.00045010
-                10: 0.00046967
-                11: 0.00048924
-                12: 0.00050881
-                13: 0.00052838
-                14: 0.00054795
-                15: 0.00056751
-                16: 0.00058708
-                17: 0.00060665
-                18: 0.00062622
-                19: 0.00064579
-                20: 0.00066536
-                21: 0.00068493
-                22: 0.00070015
-                23: 0.00071537
-                24: 0.00073059
-                25: 0.00074581
-                26: 0.00076104
-                27: 0.00077626
-                28: 0.00079148
-                29: 0.00080670
-                30: 0.00082192
         run: |
           set -ex
           yarn > /dev/null 2>&1

@@ -15,6 +15,7 @@ yarn tsx ./bin/funding-auto-renew-3.ts
 // import first before other imports
 import { getenv } from '../lib/dotenv.mjs'
 
+import { createClient } from '@supabase/supabase-js'
 import { Bitfinex, BitfinexSort, PlatformStatus } from '@taichunmin/bitfinex'
 import _ from 'lodash'
 import { scheduler } from 'node:timers/promises'
@@ -130,6 +131,59 @@ const ZodDb = z.object({
 
 class SkipError extends Error {}
 
+// 從 Supabase 讀取配置
+async function getConfigFromSupabase () {
+  try {
+    const supabaseUrl = getenv('SUPABASE_URL', '')
+    const supabaseKey = getenv('SUPABASE_SERVICE_KEY', '')
+
+    if (!supabaseUrl || !supabaseKey) {
+      loggers.warn('Supabase env not set, using INPUT_AUTO_RENEW_3 fallback')
+      return null
+    }
+
+    const supabase = createClient(supabaseUrl, supabaseKey)
+    const { data, error } = await supabase
+      .from('settings')
+      .select('*')
+      .eq('user_id', 'wtkuo')
+      .single()
+
+    if (error) {
+      loggers.warn(`Supabase fetch error: ${error.message}, using fallback`)
+      return null
+    }
+
+    // 構建配置對象
+    const config: Record<string, any> = {}
+
+    if (data.usd_enabled) {
+      config['USD'] = {
+        amount: data.usd_min_amount,
+        rank: data.usd_rank,
+        rateMin: data.usd_rate_min,
+        rateMax: data.usd_rate_max,
+        period: {}
+      }
+    }
+
+    if (data.usdt_enabled) {
+      config['UST'] = {
+        amount: data.usdt_min_amount,
+        rank: data.usdt_rank,
+        rateMin: data.usdt_rate_min,
+        rateMax: data.usdt_rate_max,
+        period: {}
+      }
+    }
+
+    return config
+  } catch (error) {
+    loggers.warn(`Error reading Supabase config: ${error}`)
+    return null
+  }
+}
+
 export async function main (): Promise<void> {
   if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
     loggers.error('Bitfinex API is in maintenance mode')
@@ -142,7 +196,11 @@ export async function main (): Promise<void> {
     node: process.version,
   })
 
-  const cfg = ZodConfig.parse(parseYaml(getenv('INPUT_AUTO_RENEW_3', '')))
+  // 優先從 Supabase 讀取配置，否則使用環境變數
+  let supabaseConfig = await getConfigFromSupabase()
+  const cfg = ZodConfig.parse(
+    supabaseConfig ?? parseYaml(getenv('INPUT_AUTO_RENEW_3', ''))
+  )
 
   const db = ZodDb.parse((await bitfinex.v2AuthReadSettings([DB_KEY]).catch(() => ({})))[DB_KEY.slice(4)])
   ymlDump('db', db)
