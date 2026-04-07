@@ -61,6 +61,9 @@ jobs:
         working-directory: webapp
 
       - name: Build webapp (static export)
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: npm run build
         working-directory: webapp
 
