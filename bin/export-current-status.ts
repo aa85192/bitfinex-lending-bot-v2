@@ -39,11 +39,10 @@ async function main (): Promise<void> {
   let hasError = false
   for (const currency of currencys) {
     try {
-      const [credits, offers, autoRenew] = await Promise.all([
-        bitfinex.v2AuthReadFundingCredits({ currency }),
-        bitfinex.v2AuthReadFundingOffers({ currency }),
-        bitfinex.v2AuthReadFundingAutoStatus({ currency }).catch(() => null),
-      ])
+      // 循序呼叫避免 nonce 衝突
+      const credits = await bitfinex.v2AuthReadFundingCredits({ currency })
+      const offers = await bitfinex.v2AuthReadFundingOffers({ currency })
+      const autoRenew = await bitfinex.v2AuthReadFundingAutoStatus({ currency }).catch(() => null)
 
       const fundingWallet = (wallets as any[]).find(
         (w: any) => w.type === 'funding' && w.currency === currency
