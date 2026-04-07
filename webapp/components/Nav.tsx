@@ -9,6 +9,7 @@ export default function Nav() {
   const links = [
     { href: '/', label: '即時狀態' },
     { href: '/history', label: '歷史紀錄' },
+    { href: '/settings', label: '⚙️ 設定' },
   ]
 
   return (

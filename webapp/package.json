@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.38.4",
     "@taichunmin/bitfinex": "^0.0.15",
     "dayjs": "^1.11.13",
     "next": "^16.2.2",
