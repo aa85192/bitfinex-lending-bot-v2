@@ -7,7 +7,7 @@ if (!supabaseUrl || !supabaseAnonKey) {
   throw new Error('Missing Supabase environment variables')
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+export const supabase = createClient(supabaseUrl!, supabaseAnonKey!)
 
 // 服務器端客戶端（用於 API routes）
 export function createServiceClient() {
@@ -17,5 +17,5 @@ export function createServiceClient() {
     throw new Error('Missing SUPABASE_SERVICE_KEY')
   }
 
-  return createClient(supabaseUrl, supabaseServiceKey)
+  return createClient(supabaseUrl!, supabaseServiceKey)
 }
