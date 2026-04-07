@@ -1,7 +1,6 @@
 # Bitfinex 自動放貸機器人 v2
-
+感謝[戴均民](https://github.com/taichunmin) 前輩無私地分享
 Bitfinex 自動放貸機器人，自動調整放貸利率並生成收益統計報表。
-
 基於 [taichunmin/bitfinex-lending-bot](https://github.com/taichunmin/bitfinex-lending-bot) 修改而來。
 
 ---
