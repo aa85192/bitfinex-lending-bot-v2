@@ -128,3 +128,6 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+webapp/.next/
+webapp/node_modules/
+webapp/.env.local
