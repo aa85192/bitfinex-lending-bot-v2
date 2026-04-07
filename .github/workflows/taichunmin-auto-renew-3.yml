@@ -48,7 +48,7 @@ jobs:
           INPUT_AUTO_RENEW_3: |
             USD:
               amount: 0
-              rank: 0.8
+              rank: 0.85
               rateMax: 0.001
               rateMin: 0.0001918
               period:
