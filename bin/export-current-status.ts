@@ -9,12 +9,8 @@ INPUT_CURRENCYS=USD,UST yarn tsx ./bin/export-current-status.ts
 import { getenv } from '../lib/dotenv.mjs'
 
 import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
-import _ from 'lodash'
 import { promises as fsPromises } from 'node:fs'
-import * as url from 'node:url'
-import { createLoggersByUrl } from '../lib/logger.mjs'
 
-const loggers = createLoggersByUrl(import.meta.url)
 const outdir = new URL('../dist/current-status/', import.meta.url)
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
@@ -22,19 +18,25 @@ const bitfinex = new Bitfinex({
   affCode: getenv('BITFINEX_AFF_CODE'),
 })
 
-export async function main (): Promise<void> {
+async function main (): Promise<void> {
+  const apiKey = getenv('BITFINEX_API_KEY')
+  if (!apiKey) throw new Error('BITFINEX_API_KEY 未設定')
+
   const currencys = getenv('INPUT_CURRENCYS', 'USD,UST')
     .split(',')
     .map(s => s.trim().toUpperCase())
     .filter(Boolean)
 
-  if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
-    loggers.error('Bitfinex API is in maintenance mode')
-    return
+  if (currencys.length === 0) throw new Error('INPUT_CURRENCYS 未設定')
+
+  const platformStatus = await Bitfinex.v2PlatformStatus()
+  if (platformStatus.status === PlatformStatus.MAINTENANCE) {
+    throw new Error('Bitfinex API is in maintenance mode')
   }
 
   const wallets = await bitfinex.v2AuthReadWallets()
 
+  let hasError = false
   for (const currency of currencys) {
     try {
       const [credits, offers, autoRenew] = await Promise.all([
@@ -48,9 +50,7 @@ export async function main (): Promise<void> {
       )
 
       const data = {
-        wallet: {
-          balance: fundingWallet?.balance ?? 0,
-        },
+        wallet: { balance: fundingWallet?.balance ?? 0 },
         credits: (credits as any[])
           .filter((c: any) => c.side === 1)
           .map((c: any) => ({
@@ -79,15 +79,15 @@ export async function main (): Promise<void> {
         updatedAt: new Date().toISOString(),
       }
 
-      await writeFile(
-        new URL(`${currency}.json`, outdir),
-        JSON.stringify(data, null, 2),
-      )
-      loggers.log(`Exported current status for ${currency}`)
+      await writeFile(new URL(`${currency}.json`, outdir), JSON.stringify(data, null, 2))
+      console.log(`[export-current-status] ✓ ${currency}: balance=${data.wallet.balance}, credits=${data.credits.length}, offers=${data.offers.length}`)
     } catch (err) {
-      loggers.error(`Failed to export ${currency}:`, err)
+      console.error(`[export-current-status] ✗ ${currency} failed:`, err)
+      hasError = true
     }
   }
+
+  if (hasError) throw new Error('部分幣種匯出失敗，請檢查上方錯誤')
 }
 
 async function writeFile (filepath: URL, data: string): Promise<void> {
@@ -96,6 +96,6 @@ async function writeFile (filepath: URL, data: string): Promise<void> {
 }
 
 main().catch(err => {
-  loggers.error(err)
+  console.error('[export-current-status] Fatal error:', err)
   process.exit(1)
 })

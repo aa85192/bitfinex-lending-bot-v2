@@ -12,6 +12,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 必須指定此 environment，secrets 才能讀取到
+    environment: aa85192
     env:
       BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
       BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
