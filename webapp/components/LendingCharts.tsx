@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import {
   ComposedChart, Bar, Line,
   XAxis, YAxis, CartesianGrid, Tooltip,
@@ -183,6 +183,14 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
   const [preset, setPreset] = useState<Preset>('30d')
   const [startDate, setStartDate] = useState(daysAgo(30))
   const [endDate, setEndDate] = useState(toISO(new Date()))
+  const [isMobile, setIsMobile] = useState(false)
+
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 640)
+    check()
+    window.addEventListener('resize', check)
+    return () => window.removeEventListener('resize', check)
+  }, [])
 
   const handlePreset = (p: Preset) => {
     setPreset(p)
@@ -201,8 +209,8 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
 
   const data = useMemo(() => aggregateRecords(filtered, grouping), [filtered, grouping])
 
-  // responsive tick interval — approximate mobile as window <= 640
-  const interval = useMemo(() => tickInterval(data.length, false), [data.length])
+  // responsive tick interval — use actual mobile detection
+  const interval = useMemo(() => tickInterval(data.length, isMobile), [data.length, isMobile])
 
   const axisStyle = { fontSize: 11, fill: '#9ca3af' }
 
@@ -294,12 +302,6 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
       <ChartCard title={`${currency} 放貸利息`}>
         <ResponsiveContainer width="100%" height={220}>
           <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="gradInterest" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#34d399" stopOpacity={0.95} />
-                <stop offset="100%" stopColor="#059669" stopOpacity={0.8} />
-              </linearGradient>
-            </defs>
             <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#f3f4f6" />
             <XAxis dataKey="label" tick={axisStyle} interval={interval} axisLine={false} tickLine={false} />
             <YAxis
@@ -310,7 +312,7 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
               width={48}
             />
             <Tooltip content={<InterestTooltip />} cursor={{ fill: 'rgba(16,185,129,0.06)' }} />
-            <Bar dataKey="interest" fill="url(#gradInterest)" radius={[4, 4, 0, 0]} maxBarSize={32} />
+            <Bar dataKey="interest" fill="#34d399" radius={[4, 4, 0, 0]} maxBarSize={32} />
           </ComposedChart>
         </ResponsiveContainer>
       </ChartCard>
@@ -319,12 +321,6 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
       <ChartCard title={`${currency} 放貸年化`}>
         <ResponsiveContainer width="100%" height={240}>
           <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="gradApr" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#a7f3d0" stopOpacity={0.9} />
-                <stop offset="100%" stopColor="#6ee7b7" stopOpacity={0.6} />
-              </linearGradient>
-            </defs>
             <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#f3f4f6" />
             <XAxis dataKey="label" tick={axisStyle} interval={interval} axisLine={false} tickLine={false} />
             <YAxis
@@ -335,7 +331,7 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
               width={48}
             />
             <Tooltip content={<ApyTooltip />} cursor={{ fill: 'rgba(16,185,129,0.06)' }} />
-            <Bar dataKey="apr1" fill="url(#gradApr)" radius={[4, 4, 0, 0]} maxBarSize={32} name="apr1" />
+            <Bar dataKey="apr1" fill="#6ee7b7" radius={[4, 4, 0, 0]} maxBarSize={32} name="apr1" />
             <Line type="monotone" dataKey="apr7" stroke="#14b8a6" strokeWidth={2} dot={false} name="apr7" />
             <Line type="monotone" dataKey="apr30" stroke="#8b5cf6" strokeWidth={2} strokeDasharray="5 3" dot={false} name="apr30" />
             <Legend
@@ -356,12 +352,6 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
       <ChartCard title={`${currency} 資金利用率`}>
         <ResponsiveContainer width="100%" height={220}>
           <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="gradUtil" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#bef264" stopOpacity={0.95} />
-                <stop offset="100%" stopColor="#84cc16" stopOpacity={0.75} />
-              </linearGradient>
-            </defs>
             <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#f3f4f6" />
             <XAxis dataKey="label" tick={axisStyle} interval={interval} axisLine={false} tickLine={false} />
             <YAxis
@@ -373,7 +363,7 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
               width={40}
             />
             <Tooltip content={<UtilTooltip />} cursor={{ fill: 'rgba(132,204,22,0.06)' }} />
-            <Bar dataKey="utilization" fill="url(#gradUtil)" radius={[4, 4, 0, 0]} maxBarSize={32} />
+            <Bar dataKey="utilization" fill="#a3e635" radius={[4, 4, 0, 0]} maxBarSize={32} />
           </ComposedChart>
         </ResponsiveContainer>
       </ChartCard>
