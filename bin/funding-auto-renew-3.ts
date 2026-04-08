@@ -341,10 +341,9 @@ export async function main (): Promise<void> {
         const db1: Record<string, any> = db.notified?.[currency] ?? {}
         const autoRenew = _.pickBy(trace.newAutoRenew, _.isNumber)
 
-        const [creditsRaw, orders] = await Promise.all([
-          bitfinex.v2AuthReadFundingCredits({ currency }),
-          bitfinex.v2AuthReadFundingOffers({ currency }),
-        ])
+        // 循序呼叫避免 nonce 衝突
+        const creditsRaw = await bitfinex.v2AuthReadFundingCredits({ currency })
+        const orders = await bitfinex.v2AuthReadFundingOffers({ currency })
         const credits = _.chain(creditsRaw)
           .filter(({ side }) => side === 1)
           .map(credit => _.pick(credit, ['id', 'amount', 'rate', 'period', 'mtsOpening']))

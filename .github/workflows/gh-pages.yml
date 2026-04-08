@@ -43,6 +43,12 @@ jobs:
       - name: Install dependencies (yarn)
         run: yarn
 
+      - name: Export current status (USD + UST)
+        run: INPUT_CURRENCYS=USD,UST yarn tsx ./bin/export-current-status.ts
+
+      - name: Generate funding statistics (USD)
+        run: INPUT_CURRENCYS=USD yarn tsx ./bin/funding-statistics-1.ts
+
       - name: Setup Node.js for webapp (npm)
         uses: actions/setup-node@v4
         with:
@@ -60,12 +66,6 @@ jobs:
 
       - name: Copy webapp output into dist/
         run: cp -r webapp/out/. dist/
-
-      - name: Export current status (USD + UST)
-        run: INPUT_CURRENCYS=USD,UST yarn tsx ./bin/export-current-status.ts
-
-      - name: Generate funding statistics (USD)
-        run: INPUT_CURRENCYS=USD yarn tsx ./bin/funding-statistics-1.ts
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
