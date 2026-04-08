@@ -149,14 +149,16 @@ export async function main (): Promise<void> {
 async function calcUtilizationByDate (currency: string): Promise<Record<string, number>> {
   try {
     // hist: last 3 days of closed credits; active: currently open credits (use now as closedAt)
-    const [histCredits, activeCredits] = await Promise.all([
+    const [histCredits, activeCredits, offers] = await Promise.all([
       bitfinex.v2AuthReadFundingCreditsHist({ currency, limit: 500 }),
       bitfinex.v2AuthReadFundingCredits({ currency }),
+      bitfinex.v2AuthReadFundingOffers({ currency }),
     ])
     const now = Date.now()
     const credits = [
       ...histCredits,
       ...activeCredits.map(c => ({ ...c, mtsUpdate: new Date(now) })),
+      ...offers.map(o => ({ ...o, mtsOpening: new Date(now), mtsUpdate: new Date(now), side: 1, amount: o.amount })),
     ]
     const results: Record<string, number> = {}
 
