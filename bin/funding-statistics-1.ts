@@ -35,6 +35,25 @@ function ymlDump (key: string, val: any): void {
   loggers.log(_.set({}, key, val))
 }
 
+// 從帳本條目中計算每日的開盤餘額（首筆交易之前）與收盤餘額（最後一筆交易之後）
+// 用途：準確計算入金日的 investment，避免入金膨脹分母導致使用率偏低
+function computeDayBalances (
+  entries: Array<{ mts: Date | number, balance: number, amount: number }>,
+): { dayOpenBalances: Record<string, number>, dayCloseBalances: Record<string, number> } {
+  const sorted = _.sortBy(entries, e => +new Date(e.mts as any))
+  const dayOpenBalances: Record<string, number> = {}
+  const dayCloseBalances: Record<string, number> = {}
+  for (const entry of sorted) {
+    const date = dayjs(entry.mts as any).format('YYYY-MM-DD')
+    if (!(date in dayOpenBalances)) {
+      // 首筆交易前的餘額 = 當天開盤餘額（入金/利息尚未計入）
+      dayOpenBalances[date] = _.round(entry.balance - entry.amount, 8)
+    }
+    dayCloseBalances[date] = entry.balance // 每次更新，最後保留的是當天最後一筆交易後的餘額
+  }
+  return { dayOpenBalances, dayCloseBalances }
+}
+
 const ZodConfig = z.object({
   currencys: z.array(z.string().trim().regex(/^[\w:]+$/).toUpperCase()),
   db: z.string().url(),
@@ -71,18 +90,35 @@ export async function main (): Promise<void> {
     payments = _.sortBy(payments, ['mts'])
     // ymlDump('payments', payments)
 
+    // 取得所有帳本條目（含入金/出金/利息），用於還原每日開盤與收盤餘額
+    // 循序呼叫避免 nonce 衝突
+    const allLedgerEntries = await bitfinex.v2AuthReadLedgersHist({ currency, limit: 2500 })
+    const { dayOpenBalances, dayCloseBalances } = computeDayBalances(
+      (allLedgerEntries as any[]).filter((e: any) => e.wallet === 'funding'),
+    )
+
     const stats: Record<string, any> = {}
     let [dateMax, dateMin]: any[] = [null, null]
     const tplStat = date => ({ date, interest: 0, balance: null, investment: null, utilization: 0, dpr: 0, apr1: 0, apr7: 0, apr30: 0, apr365: 0 })
+
+    // Phase 1: 累積每日利息
     for (const payment of payments) {
       const date1 = dayjs(payment.mts).format('YYYY-MM-DD')
       dateMax = _.max([dateMax ?? date1, date1])
       dateMin = _.min([dateMin ?? date1, date1])
-
       const stat = stats[date1] ??= tplStat(date1)
-      stat.balance = Math.max(stat.balance ?? 0, payment.balance)
       stat.interest += payment.amount
-      stat.investment = _.round(stat.balance - stat.interest, 8)
+      // 保留 max balance 作為 fallback（當 allLedgerEntries 資料不足以覆蓋該日時使用）
+      stat.balance = Math.max(stat.balance ?? 0, payment.balance)
+    }
+
+    // Phase 2: 以正確 investment（開盤餘額）計算 apr1，並擴散至滾動 APR 累加器
+    // 每日只執行一次，修正同日多筆利息導致 APR 重複累加的舊問題
+    for (const [date1, stat] of _.entries(stats)) {
+      const openBal = dayOpenBalances[date1]
+      stat.investment = openBal != null
+        ? openBal
+        : _.round((stat.balance ?? 0) - stat.interest, 8) // fallback: 舊邏輯
       stat.dpr = stat.investment <= 0 ? 0 : stat.interest * 100 / stat.investment
       stat.apr1 = stat.dpr * 365
 
@@ -95,12 +131,16 @@ export async function main (): Promise<void> {
         ;(stats[date2] ??= tplStat(date2)).apr365 += stat.apr1
       }
     }
+
+    // Phase 3: 補全所有日期，計算使用率，正規化滾動 APR
     let prevBalance = 0
     for (let ts2 = dayjs(dateMin); ts2 <= tsToday; ts2 = ts2.add(1, 'day')) {
       const date2 = ts2.format('YYYY-MM-DD')
       const stat = stats[date2] ??= tplStat(date2)
-      stat.investment ??= prevBalance
-      stat.balance ??= prevBalance
+      const openBal = dayOpenBalances[date2] ?? prevBalance
+      stat.investment ??= openBal
+      // balance 優先使用當日收盤餘額（含入金後的實際餘額）
+      stat.balance = dayCloseBalances[date2] ?? stat.balance ?? openBal
       prevBalance = stat.balance
       const utilizedAmountByDay = utilizationByDate[date2] ?? 0
       stat.utilization = stat.investment <= 0 ? 0 : _.round(100 * utilizedAmountByDay / stat.investment, 8)
