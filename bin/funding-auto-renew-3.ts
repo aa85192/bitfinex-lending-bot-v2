@@ -396,9 +396,10 @@ export async function main (): Promise<void> {
         const ordersAmountSum = _.sumBy(orders, 'amount')
         // 帳戶總金額 = 可用 + 已借出 + 掛單中（避免入金後利用率失真）
         const totalAmount = wallet.balance + creditsAmountSum + ordersAmountSum
-        // 綜合 APR（基於帳戶總金額的實際年化收益率）
+        // 綜合 APR（基於帳戶總金額）、借出 APR（僅借出部分，不受入金稀釋）
         const weightedRateSum = _.sumBy(creditsForCalc, c => c.rate * c.amount)
         const portfolioApr = totalAmount > 0 ? weightedRateSum * 365 / totalAmount : 0
+        const borrowedApr = creditsAmountSum > 0 ? weightedRateSum * 365 / creditsAmountSum : 0
         const credits = _.map(creditsForCalc, credit => ({
           ...credit,
           mtsOpening: dayjs(credit.mtsOpening).utcOffset(8).format('M/D HH:mm'),
@@ -416,8 +417,10 @@ export async function main (): Promise<void> {
 自動掛單設定:
     利率: ${floatFormatPercent(autoRenew.rate, 6)}
     APR: ${floatFormatPercent(autoRenew.rate * 365)}
-    綜合APR: ${floatFormatPercent(portfolioApr)}
-    天數: ${autoRenew.period}`),
+    天數: ${autoRenew.period}
+收益率:
+    借出APR: ${floatFormatPercent(borrowedApr)}
+    綜合APR: ${floatFormatPercent(portfolioApr)}`),
           `更新: ${telegram.tgMdEscape(nowts.format('M/D HH:mm'))}\n`,
           '**>```',
           ymlStringify({ credits }),
