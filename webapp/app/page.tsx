@@ -198,7 +198,6 @@ export default function StatusPage () {
           records={history}
           loading={historyLoading}
           currency={currency}
-          currentTotalAmount={totalAmount} // 新增：傳入當前總金額做為基準
         />
       </div>
     </div>
