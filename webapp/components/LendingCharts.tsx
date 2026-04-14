@@ -2,13 +2,11 @@
 
 import { useState, useMemo } from 'react'
 import {
-  ComposedChart, Bar, Line,
+  ComposedChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, Legend, Cell,
+  ResponsiveContainer, Legend
 } from 'recharts'
 import type { HistoryRecord } from './HistoryTable'
-
-// ─── types ──────────────────────────────────────────────────────────────────
 
 type Grouping = 'day' | 'week' | 'month'
 type Preset = '7d' | '30d' | '90d' | '1y' | 'custom'
@@ -17,13 +15,12 @@ interface ChartPoint {
   date: string
   label: string
   interest: number
-  apr1: number
-  apr7: number
-  apr30: number
   utilization: number
+  idleUtilization: number
+  aprTotal: number
+  aprLentDiff: number
+  lentApr: number
 }
-
-// ─── helpers ────────────────────────────────────────────────────────────────
 
 function toISO (d: Date) { return d.toISOString().slice(0, 10) }
 function daysAgo (n: number) {
@@ -41,18 +38,22 @@ function startOfWeek (dateStr: string) {
 
 function aggregateRecords (records: HistoryRecord[], grouping: Grouping): ChartPoint[] {
   if (grouping === 'day') {
-    return records.map(r => ({
-      date: r.date,
-      label: r.date.slice(5).replace('-', '/'),
-      interest: r.interest,
-      apr1: r.apr1,
-      apr7: r.apr7,
-      apr30: r.apr30,
-      utilization: r.utilization,
-    }))
+    return records.map(r => {
+      const lentApr = r.utilization > 0 ? (r.apr1 * 100) / r.utilization : 0
+      return {
+        date: r.date,
+        label: r.date.slice(5).replace('-', '/'),
+        interest: r.interest,
+        utilization: r.utilization,
+        idleUtilization: Math.max(0, 100 - r.utilization),
+        aprTotal: r.apr1,
+        aprLentDiff: Math.max(0, lentApr - r.apr1),
+        lentApr: lentApr,
+      }
+    })
   }
 
-  type G = { date: string; label: string; interest: number; s1: number; s7: number; s30: number; su: number; n: number }
+  type G = { date: string; label: string; interest: number; s1: number; su: number; n: number }
   const groups: Record<string, G> = {}
 
   for (const r of records) {
@@ -65,35 +66,39 @@ function aggregateRecords (records: HistoryRecord[], grouping: Grouping): ChartP
       key = r.date.slice(0, 7)
       label = `${parseInt(r.date.slice(5, 7))}月`
     }
-    const g = (groups[key] ??= { date: key, label, interest: 0, s1: 0, s7: 0, s30: 0, su: 0, n: 0 })
+    const g = (groups[key] ??= { date: key, label, interest: 0, s1: 0, su: 0, n: 0 })
     g.interest += r.interest
     g.s1 += r.apr1
-    g.s7 += r.apr7
-    g.s30 += r.apr30
     g.su += r.utilization
     g.n++
   }
 
   return Object.values(groups)
     .sort((a, b) => a.date.localeCompare(b.date))
-    .map(g => ({
-      date: g.date,
-      label: g.label,
-      interest: g.interest,
-      apr1: g.n > 0 ? g.s1 / g.n : 0,
-      apr7: g.n > 0 ? g.s7 / g.n : 0,
-      apr30: g.n > 0 ? g.s30 / g.n : 0,
-      utilization: g.n > 0 ? g.su / g.n : 0,
-    }))
+    .map(g => {
+      const aprTotal = g.n > 0 ? g.s1 / g.n : 0
+      const utilization = g.n > 0 ? g.su / g.n : 0
+      const lentApr = utilization > 0 ? (aprTotal * 100) / utilization : 0
+
+      return {
+        date: g.date,
+        label: g.label,
+        interest: g.interest,
+        utilization: utilization,
+        idleUtilization: Math.max(0, 100 - utilization),
+        aprTotal: aprTotal,
+        aprLentDiff: Math.max(0, lentApr - aprTotal),
+        lentApr: lentApr,
+      }
+    })
 }
 
-// auto-skip X-axis ticks to avoid crowding
 function tickInterval (count: number, isMobile: boolean) {
   const maxTicks = isMobile ? 6 : 14
   return count <= maxTicks ? 0 : Math.ceil(count / maxTicks) - 1
 }
 
-// ─── custom tooltip ──────────────────────────────────────────────────────────
+// ─── custom tooltips ─────────────────────────────────────────────────────────
 
 function InterestTooltip ({ active, payload, label }: any) {
   if (!active || !payload?.length) return null
@@ -101,31 +106,55 @@ function InterestTooltip ({ active, payload, label }: any) {
   return (
     <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-3 py-2 text-xs">
       <p className="text-gray-500 mb-1">{label}</p>
-      <p className="font-semibold text-emerald-600">{v?.toFixed(8)}</p>
+      <p className="font-semibold text-indigo-600">{v?.toFixed(8)}</p>
     </div>
   )
 }
 
 function ApyTooltip ({ active, payload, label }: any) {
   if (!active || !payload?.length) return null
-  const find = (name: string) => payload.find((p: any) => p.dataKey === name)?.value as number | undefined
+  const data = payload[0].payload
   return (
-    <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-3 py-2 text-xs space-y-1">
-      <p className="text-gray-500 mb-0.5">{label}</p>
-      {find('apr1') != null && <p><span className="text-gray-400">1日年化　</span><span className="font-semibold text-emerald-600">{find('apr1')?.toFixed(2)}%</span></p>}
-      {find('apr7') != null && <p><span className="text-gray-400">7日年化　</span><span className="font-semibold text-teal-500">{find('apr7')?.toFixed(2)}%</span></p>}
-      {find('apr30') != null && <p><span className="text-gray-400">30日年化　</span><span className="font-semibold text-violet-500">{find('apr30')?.toFixed(2)}%</span></p>}
+    <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-3 py-2.5 text-xs space-y-2 min-w-[140px]">
+      <p className="text-gray-500 mb-1 border-b border-gray-50 pb-1">{label}</p>
+      <div className="flex justify-between items-center gap-4">
+        <div className="flex items-center gap-1.5">
+          <div className="w-2 h-2 rounded-sm bg-emerald-200" />
+          <span className="text-gray-500">借出當下 APR</span>
+        </div>
+        <span className="font-semibold text-gray-900">{data.lentApr?.toFixed(2)}%</span>
+      </div>
+      <div className="flex justify-between items-center gap-4">
+        <div className="flex items-center gap-1.5">
+          <div className="w-2 h-2 rounded-sm bg-emerald-500" />
+          <span className="text-gray-500">綜合換算 APR</span>
+        </div>
+        <span className="font-semibold text-gray-900">{data.aprTotal?.toFixed(2)}%</span>
+      </div>
     </div>
   )
 }
 
 function UtilTooltip ({ active, payload, label }: any) {
   if (!active || !payload?.length) return null
-  const v = payload[0]?.value as number
+  const data = payload[0].payload
   return (
-    <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-3 py-2 text-xs">
-      <p className="text-gray-500 mb-1">{label}</p>
-      <p className="font-semibold text-lime-600">{v?.toFixed(1)}%</p>
+    <div className="bg-white border border-gray-100 rounded-xl shadow-lg px-3 py-2.5 text-xs space-y-2 min-w-[140px]">
+      <p className="text-gray-500 mb-1 border-b border-gray-50 pb-1">{label}</p>
+      <div className="flex justify-between items-center gap-4">
+        <div className="flex items-center gap-1.5">
+          <div className="w-2 h-2 rounded-sm bg-blue-500" />
+          <span className="text-gray-500">已借出利用率</span>
+        </div>
+        <span className="font-semibold text-gray-900">{data.utilization?.toFixed(1)}%</span>
+      </div>
+      <div className="flex justify-between items-center gap-4">
+        <div className="flex items-center gap-1.5">
+          <div className="w-2 h-2 rounded-sm bg-blue-200" />
+          <span className="text-gray-500">閒置 / 未成交</span>
+        </div>
+        <span className="font-semibold text-gray-900">{data.idleUtilization?.toFixed(1)}%</span>
+      </div>
     </div>
   )
 }
@@ -146,8 +175,6 @@ const GROUPINGS: { label: string; value: Grouping }[] = [
   { label: '月', value: 'month' },
 ]
 
-// ─── chart card wrapper ───────────────────────────────────────────────────────
-
 function ChartCard ({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="card p-0 overflow-hidden">
@@ -159,8 +186,6 @@ function ChartCard ({ title, children }: { title: string; children: React.ReactN
   )
 }
 
-// ─── skeleton ────────────────────────────────────────────────────────────────
-
 function ChartSkeleton () {
   return (
     <div className="card">
@@ -170,15 +195,7 @@ function ChartSkeleton () {
   )
 }
 
-// ─── main component ──────────────────────────────────────────────────────────
-
-interface LendingChartsProps {
-  records: HistoryRecord[]
-  loading: boolean
-  currency: string
-}
-
-export default function LendingCharts ({ records, loading, currency }: LendingChartsProps) {
+export default function LendingCharts ({ records, loading, currency }: { records: HistoryRecord[], loading: boolean, currency: string }) {
   const [grouping, setGrouping] = useState<Grouping>('day')
   const [preset, setPreset] = useState<Preset>('30d')
   const [startDate, setStartDate] = useState(daysAgo(30))
@@ -200,28 +217,15 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
   }, [records, startDate, endDate])
 
   const data = useMemo(() => aggregateRecords(filtered, grouping), [filtered, grouping])
-
-  // responsive tick interval — approximate mobile as window <= 640
   const interval = useMemo(() => tickInterval(data.length, false), [data.length])
-
   const axisStyle = { fontSize: 11, fill: '#9ca3af' }
 
   if (loading) {
-    return (
-      <div className="space-y-4">
-        <ChartSkeleton />
-        <ChartSkeleton />
-        <ChartSkeleton />
-      </div>
-    )
+    return <div className="space-y-4"><ChartSkeleton /><ChartSkeleton /><ChartSkeleton /></div>
   }
 
   if (records.length === 0) {
-    return (
-      <div className="card text-center text-sm text-gray-400 py-10">
-        歷史資料尚未載入
-      </div>
-    )
+    return <div className="card text-center text-sm text-gray-400 py-10">歷史資料尚未載入</div>
   }
 
   return (
@@ -229,7 +233,6 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
       {/* ── controls ── */}
       <div className="card py-4">
         <div className="flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
-          {/* Grouping */}
           <div className="flex items-center gap-2">
             <span className="text-xs text-gray-400 whitespace-nowrap">柱寬</span>
             <div className="flex rounded-lg border border-gray-200 overflow-hidden text-sm">
@@ -238,9 +241,7 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
                   key={g.value}
                   onClick={() => setGrouping(g.value)}
                   className={`px-3 py-1.5 font-medium transition-colors ${
-                    grouping === g.value
-                      ? 'bg-emerald-500 text-white'
-                      : 'text-gray-500 hover:bg-gray-50'
+                    grouping === g.value ? 'bg-emerald-500 text-white' : 'text-gray-500 hover:bg-gray-50'
                   }`}
                 >
                   {g.label}
@@ -249,7 +250,6 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
             </div>
           </div>
 
-          {/* Preset + custom dates */}
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex rounded-lg border border-gray-200 overflow-hidden text-sm">
               {PRESETS.map(p => (
@@ -257,9 +257,7 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
                   key={p.value}
                   onClick={() => handlePreset(p.value)}
                   className={`px-3 py-1.5 font-medium transition-colors ${
-                    preset === p.value
-                      ? 'bg-emerald-500 text-white'
-                      : 'text-gray-500 hover:bg-gray-50'
+                    preset === p.value ? 'bg-emerald-500 text-white' : 'text-gray-500 hover:bg-gray-50'
                   }`}
                 >
                   {p.label}
@@ -268,22 +266,9 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
             </div>
             {preset === 'custom' && (
               <div className="flex items-center gap-1.5 text-sm">
-                <input
-                  type="date"
-                  value={startDate}
-                  max={endDate}
-                  onChange={e => setStartDate(e.target.value)}
-                  className="border border-gray-200 rounded-lg px-2 py-1 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-emerald-400"
-                />
+                <input type="date" value={startDate} max={endDate} onChange={e => setStartDate(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1 text-xs text-gray-700" />
                 <span className="text-gray-300">—</span>
-                <input
-                  type="date"
-                  value={endDate}
-                  min={startDate}
-                  max={toISO(new Date())}
-                  onChange={e => setEndDate(e.target.value)}
-                  className="border border-gray-200 rounded-lg px-2 py-1 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-emerald-400"
-                />
+                <input type="date" value={endDate} min={startDate} max={toISO(new Date())} onChange={e => setEndDate(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1 text-xs text-gray-700" />
               </div>
             )}
           </div>
@@ -296,84 +281,79 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
           <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
             <defs>
               <linearGradient id="gradInterest" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#34d399" stopOpacity={0.95} />
-                <stop offset="100%" stopColor="#059669" stopOpacity={0.8} />
+                <stop offset="0%" stopColor="#818cf8" stopOpacity={0.95} />
+                <stop offset="100%" stopColor="#4f46e5" stopOpacity={0.8} />
               </linearGradient>
             </defs>
             <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#f3f4f6" />
             <XAxis dataKey="label" tick={axisStyle} interval={interval} axisLine={false} tickLine={false} />
-            <YAxis
-              tick={axisStyle}
-              axisLine={false}
-              tickLine={false}
-              tickFormatter={v => v === 0 ? '0' : v.toFixed(3)}
-              width={48}
-            />
-            <Tooltip content={<InterestTooltip />} cursor={{ fill: 'rgba(16,185,129,0.06)' }} />
+            <YAxis tick={axisStyle} axisLine={false} tickLine={false} tickFormatter={v => v === 0 ? '0' : v.toFixed(3)} width={48} />
+            <Tooltip content={<InterestTooltip />} cursor={{ fill: 'rgba(99,102,241,0.06)' }} />
             <Bar dataKey="interest" fill="url(#gradInterest)" radius={[4, 4, 0, 0]} maxBarSize={32} />
           </ComposedChart>
         </ResponsiveContainer>
       </ChartCard>
 
-      {/* ── chart 2: 放貸年化 ── */}
+      {/* ── chart 2: 放貸年化 (疊加柱狀) ── */}
       <ChartCard title={`${currency} 放貸年化`}>
         <ResponsiveContainer width="100%" height={240}>
           <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="gradApr" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#a7f3d0" stopOpacity={0.9} />
-                <stop offset="100%" stopColor="#6ee7b7" stopOpacity={0.6} />
-              </linearGradient>
-            </defs>
             <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#f3f4f6" />
             <XAxis dataKey="label" tick={axisStyle} interval={interval} axisLine={false} tickLine={false} />
-            <YAxis
-              tick={axisStyle}
-              axisLine={false}
-              tickLine={false}
-              tickFormatter={v => `${v.toFixed(1)}%`}
-              width={48}
-            />
+            <YAxis tick={axisStyle} axisLine={false} tickLine={false} tickFormatter={v => `${v.toFixed(1)}%`} width={48} />
             <Tooltip content={<ApyTooltip />} cursor={{ fill: 'rgba(16,185,129,0.06)' }} />
-            <Bar dataKey="apr1" fill="url(#gradApr)" radius={[4, 4, 0, 0]} maxBarSize={32} name="apr1" />
-            <Line type="monotone" dataKey="apr7" stroke="#14b8a6" strokeWidth={2} dot={false} name="apr7" />
-            <Line type="monotone" dataKey="apr30" stroke="#8b5cf6" strokeWidth={2} strokeDasharray="5 3" dot={false} name="apr30" />
+            
+            {/* 底層：綜合 APR (深色實心) */}
+            <Bar dataKey="aprTotal" stackId="apr" fill="#10b981" maxBarSize={32} />
+            {/* 頂層：借出 APR 差額 (淺色半透明)，整根高度為借出當下 APR */}
+            <Bar dataKey="aprLentDiff" stackId="apr" fill="#a7f3d0" radius={[4, 4, 0, 0]} maxBarSize={32} />
+            
             <Legend
-              iconType="circle"
-              iconSize={8}
-              formatter={(value) => {
-                if (value === 'apr1') return <span style={{ fontSize: 11, color: '#6b7280' }}>1日年化</span>
-                if (value === 'apr7') return <span style={{ fontSize: 11, color: '#6b7280' }}>7日年化</span>
-                if (value === 'apr30') return <span style={{ fontSize: 11, color: '#6b7280' }}>30日年化</span>
-                return value
-              }}
+              content={() => (
+                <div className="flex items-center justify-center gap-5 mt-3 text-xs text-gray-500">
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-3 h-3 rounded-sm bg-[#10b981]" />
+                    <span>綜合換算 APR</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-3 h-3 rounded-sm bg-[#a7f3d0]" />
+                    <span>借出當下 APR (總高度)</span>
+                  </div>
+                </div>
+              )}
             />
           </ComposedChart>
         </ResponsiveContainer>
       </ChartCard>
 
-      {/* ── chart 3: 資金利用率 ── */}
+      {/* ── chart 3: 資金利用率 (滿版 100% 疊加柱狀) ── */}
       <ChartCard title={`${currency} 資金利用率`}>
-        <ResponsiveContainer width="100%" height={220}>
+        <ResponsiveContainer width="100%" height={240}>
           <ComposedChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-            <defs>
-              <linearGradient id="gradUtil" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#bef264" stopOpacity={0.95} />
-                <stop offset="100%" stopColor="#84cc16" stopOpacity={0.75} />
-              </linearGradient>
-            </defs>
             <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#f3f4f6" />
             <XAxis dataKey="label" tick={axisStyle} interval={interval} axisLine={false} tickLine={false} />
-            <YAxis
-              domain={[0, 100]}
-              tick={axisStyle}
-              axisLine={false}
-              tickLine={false}
-              tickFormatter={v => `${v}%`}
-              width={40}
+            <YAxis domain={[0, 100]} tick={axisStyle} axisLine={false} tickLine={false} tickFormatter={v => `${v}%`} width={40} />
+            <Tooltip content={<UtilTooltip />} cursor={{ fill: 'rgba(59,130,246,0.06)' }} />
+            
+            {/* 底層：實際借出 (深藍) */}
+            <Bar dataKey="utilization" stackId="util" fill="#3b82f6" maxBarSize={32} />
+            {/* 頂層：閒置/未成交掛單 (淺藍) */}
+            <Bar dataKey="idleUtilization" stackId="util" fill="#bfdbfe" radius={[4, 4, 0, 0]} maxBarSize={32} />
+            
+            <Legend
+              content={() => (
+                <div className="flex items-center justify-center gap-5 mt-3 text-xs text-gray-500">
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-3 h-3 rounded-sm bg-[#3b82f6]" />
+                    <span>已借出資金</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-3 h-3 rounded-sm bg-[#bfdbfe]" />
+                    <span>閒置 / 未成交</span>
+                  </div>
+                </div>
+              )}
             />
-            <Tooltip content={<UtilTooltip />} cursor={{ fill: 'rgba(132,204,22,0.06)' }} />
-            <Bar dataKey="utilization" fill="url(#gradUtil)" radius={[4, 4, 0, 0]} maxBarSize={32} />
           </ComposedChart>
         </ResponsiveContainer>
       </ChartCard>
