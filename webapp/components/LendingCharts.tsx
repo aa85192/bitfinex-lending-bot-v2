@@ -16,15 +16,14 @@ interface ChartPoint {
   label: string
   interest: number
   
-  aprHistorical: number
-  aprCurrentTrue: number
-  aprCurrentRender: number
-  aprDiff: number
+  // APR 相關
+  aprTotal: number      // 綜合換算 APR (歷史當天本金)
+  aprLent: number       // 借出當下 APR
+  aprDiff: number       // 兩者差額 (用於疊加上層)
 
-  utilHistorical: number
-  utilCurrentTrue: number
-  utilCurrentRender: number
-  utilDiff: number
+  // 利用率相關
+  utilization: number   // 綜合換算利用率 (歷史當天)
+  idleUtil: number      // 閒置比例
 }
 
 function toISO (d: Date) { return d.toISOString().slice(0, 10) }
@@ -40,43 +39,32 @@ function startOfWeek (dateStr: string) {
   return toISO(d)
 }
 
-function aggregateRecords (records: HistoryRecord[], grouping: Grouping, currentTotalAmount: number): ChartPoint[] {
-  // 避免除以 0，若未入金或無資料，預設為 1
-  const safeTotal = currentTotalAmount > 0 ? currentTotalAmount : 1;
-
+function aggregateRecords (records: HistoryRecord[], grouping: Grouping): ChartPoint[] {
   if (grouping === 'day') {
     return records.map(r => {
-      // 1. 放貸年化邏輯
-      const historicalApr = r.apr1 || 0; // 借出當下換算年化 (從 API 原生取得)
-      const currentApr = (r.interest * 365 * 100) / safeTotal; // 綜合換算年化 (以當前入金後總額計算)
-
-      // 2. 資金利用率邏輯
-      const historicalInv = (r as any).investment || 0; // 抓取腳本原有的投資本金
-      const historicalUtilAmount = (r.utilization * historicalInv) / 100; // 反推當天真實借出金額
-      const historicalUtil = r.utilization || 0; // 借出當下利用率 (API原生)
-      const currentUtil = (historicalUtilAmount / safeTotal) * 100; // 綜合換算利用率
+      // 數學修正：r.apr1 本身就是用歷史當天「總本金」算出來的「綜合換算 APR」
+      const aprTotal = r.apr1 || 0;
+      const util = r.utilization || 0;
+      
+      // 借出當下的真實利率 = 綜合利率 / 利用率
+      const aprLent = util > 0 ? (aprTotal * 100) / util : 0;
 
       return {
         date: r.date,
         label: r.date.slice(5).replace('-', '/'),
         interest: r.interest,
 
-        aprHistorical: historicalApr,
-        aprCurrentTrue: currentApr,
-        // 防止當前計算大於歷史時超出視覺總高度 (例如出金的狀況)
-        aprCurrentRender: Math.min(historicalApr, currentApr),
-        aprDiff: Math.max(0, historicalApr - currentApr),
+        aprTotal: aprTotal,
+        aprLent: aprLent,
+        aprDiff: Math.max(0, aprLent - aprTotal),
 
-        utilHistorical: historicalUtil,
-        utilCurrentTrue: currentUtil,
-        utilCurrentRender: Math.min(historicalUtil, currentUtil),
-        utilDiff: Math.max(0, historicalUtil - currentUtil),
+        utilization: util,
+        idleUtil: Math.max(0, 100 - util),
       }
     })
   }
 
-  // 處理週、月分組平均
-  type G = { date: string; label: string; interest: number; sumAprHist: number; sumAprCurr: number; sumUtilHist: number; sumUtilCurr: number; n: number }
+  type G = { date: string; label: string; interest: number; sumAprTotal: number; sumUtil: number; n: number }
   const groups: Record<string, G> = {}
 
   for (const r of records) {
@@ -89,46 +77,31 @@ function aggregateRecords (records: HistoryRecord[], grouping: Grouping, current
       key = r.date.slice(0, 7)
       label = `${parseInt(r.date.slice(5, 7))}月`
     }
-    const g = (groups[key] ??= { date: key, label, interest: 0, sumAprHist: 0, sumAprCurr: 0, sumUtilHist: 0, sumUtilCurr: 0, n: 0 })
-
-    const historicalApr = r.apr1 || 0;
-    const currentApr = (r.interest * 365 * 100) / safeTotal;
-
-    const historicalInv = (r as any).investment || 0;
-    const historicalUtilAmount = (r.utilization * historicalInv) / 100;
-    const historicalUtil = r.utilization || 0;
-    const currentUtil = (historicalUtilAmount / safeTotal) * 100;
-
+    const g = (groups[key] ??= { date: key, label, interest: 0, sumAprTotal: 0, sumUtil: 0, n: 0 })
     g.interest += r.interest
-    g.sumAprHist += historicalApr
-    g.sumAprCurr += currentApr
-    g.sumUtilHist += historicalUtil
-    g.sumUtilCurr += currentUtil
+    g.sumAprTotal += (r.apr1 || 0)
+    g.sumUtil += (r.utilization || 0)
     g.n++
   }
 
   return Object.values(groups)
     .sort((a, b) => a.date.localeCompare(b.date))
     .map(g => {
-      const avgAprHist = g.n > 0 ? g.sumAprHist / g.n : 0;
-      const avgAprCurr = g.n > 0 ? g.sumAprCurr / g.n : 0;
-      const avgUtilHist = g.n > 0 ? g.sumUtilHist / g.n : 0;
-      const avgUtilCurr = g.n > 0 ? g.sumUtilCurr / g.n : 0;
+      const avgAprTotal = g.n > 0 ? g.sumAprTotal / g.n : 0;
+      const avgUtil = g.n > 0 ? g.sumUtil / g.n : 0;
+      const avgAprLent = avgUtil > 0 ? (avgAprTotal * 100) / avgUtil : 0;
 
       return {
         date: g.date,
         label: g.label,
         interest: g.interest,
 
-        aprHistorical: avgAprHist,
-        aprCurrentTrue: avgAprCurr,
-        aprCurrentRender: Math.min(avgAprHist, avgAprCurr),
-        aprDiff: Math.max(0, avgAprHist - avgAprCurr),
+        aprTotal: avgAprTotal,
+        aprLent: avgAprLent,
+        aprDiff: Math.max(0, avgAprLent - avgAprTotal),
 
-        utilHistorical: avgUtilHist,
-        utilCurrentTrue: avgUtilCurr,
-        utilCurrentRender: Math.min(avgUtilHist, avgUtilCurr),
-        utilDiff: Math.max(0, avgUtilHist - avgUtilCurr),
+        utilization: avgUtil,
+        idleUtil: Math.max(0, 100 - avgUtil),
       }
     })
 }
@@ -160,16 +133,16 @@ function ApyTooltip ({ active, payload, label }: any) {
       <div className="flex justify-between items-center gap-4">
         <div className="flex items-center gap-1.5">
           <div className="w-2 h-2 rounded-sm bg-emerald-200" />
-          <span className="text-gray-500">借出當下換算</span>
+          <span className="text-gray-500">借出當下 APR</span>
         </div>
-        <span className="font-semibold text-gray-900">{data.aprHistorical?.toFixed(2)}%</span>
+        <span className="font-semibold text-gray-900">{data.aprLent?.toFixed(2)}%</span>
       </div>
       <div className="flex justify-between items-center gap-4">
         <div className="flex items-center gap-1.5">
           <div className="w-2 h-2 rounded-sm bg-emerald-500" />
-          <span className="text-gray-500">綜合換算</span>
+          <span className="text-gray-500">綜合換算 APR</span>
         </div>
-        <span className="font-semibold text-gray-900">{data.aprCurrentTrue?.toFixed(2)}%</span>
+        <span className="font-semibold text-gray-900">{data.aprTotal?.toFixed(2)}%</span>
       </div>
     </div>
   )
@@ -183,17 +156,17 @@ function UtilTooltip ({ active, payload, label }: any) {
       <p className="text-gray-500 mb-1 border-b border-gray-50 pb-1">{label}</p>
       <div className="flex justify-between items-center gap-4">
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm bg-blue-200" />
-          <span className="text-gray-500">借出當下利用率</span>
+          <div className="w-2 h-2 rounded-sm bg-blue-500" />
+          <span className="text-gray-500">實際利用率</span>
         </div>
-        <span className="font-semibold text-gray-900">{data.utilHistorical?.toFixed(1)}%</span>
+        <span className="font-semibold text-gray-900">{data.utilization?.toFixed(1)}%</span>
       </div>
       <div className="flex justify-between items-center gap-4">
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm bg-blue-500" />
-          <span className="text-gray-500">綜合換算利用率</span>
+          <div className="w-2 h-2 rounded-sm bg-blue-200" />
+          <span className="text-gray-500">閒置 / 未成交</span>
         </div>
-        <span className="font-semibold text-gray-900">{data.utilCurrentTrue?.toFixed(1)}%</span>
+        <span className="font-semibold text-gray-900">{data.idleUtil?.toFixed(1)}%</span>
       </div>
     </div>
   )
@@ -239,10 +212,9 @@ interface LendingChartsProps {
   records: HistoryRecord[]
   loading: boolean
   currency: string
-  currentTotalAmount: number
 }
 
-export default function LendingCharts ({ records, loading, currency, currentTotalAmount }: LendingChartsProps) {
+export default function LendingCharts ({ records, loading, currency }: LendingChartsProps) {
   const [grouping, setGrouping] = useState<Grouping>('day')
   const [preset, setPreset] = useState<Preset>('30d')
   const [startDate, setStartDate] = useState(daysAgo(30))
@@ -263,7 +235,7 @@ export default function LendingCharts ({ records, loading, currency, currentTota
       .sort((a, b) => a.date.localeCompare(b.date))
   }, [records, startDate, endDate])
 
-  const data = useMemo(() => aggregateRecords(filtered, grouping, currentTotalAmount), [filtered, grouping, currentTotalAmount])
+  const data = useMemo(() => aggregateRecords(filtered, grouping), [filtered, grouping])
   const interval = useMemo(() => tickInterval(data.length, false), [data.length])
   const axisStyle = { fontSize: 11, fill: '#9ca3af' }
 
@@ -351,8 +323,8 @@ export default function LendingCharts ({ records, loading, currency, currentTota
             <Tooltip content={<ApyTooltip />} cursor={{ fill: 'rgba(16,185,129,0.06)' }} />
             
             {/* 底層：綜合 APR (深色實心) */}
-            <Bar dataKey="aprCurrentRender" stackId="apr" fill="#10b981" maxBarSize={32} />
-            {/* 頂層：借出當下 APR 差額 (淺色半透明)，整根高度維持為借出當下 APR */}
+            <Bar dataKey="aprTotal" stackId="apr" fill="#10b981" maxBarSize={32} />
+            {/* 頂層：借出當下 APR 差額 (淺色半透明)，整根高度為借出當下真實 APR */}
             <Bar dataKey="aprDiff" stackId="apr" fill="#a7f3d0" radius={[4, 4, 0, 0]} maxBarSize={32} />
             
             <Legend
@@ -360,11 +332,11 @@ export default function LendingCharts ({ records, loading, currency, currentTota
                 <div className="flex items-center justify-center gap-5 mt-3 text-xs text-gray-500">
                   <div className="flex items-center gap-1.5">
                     <div className="w-3 h-3 rounded-sm bg-[#10b981]" />
-                    <span>綜合換算 (現有本金)</span>
+                    <span>綜合換算 APR</span>
                   </div>
                   <div className="flex items-center gap-1.5">
                     <div className="w-3 h-3 rounded-sm bg-[#a7f3d0]" />
-                    <span>借出當下換算 (歷史本金)</span>
+                    <span>借出當下真實 APR</span>
                   </div>
                 </div>
               )}
@@ -382,21 +354,21 @@ export default function LendingCharts ({ records, loading, currency, currentTota
             <YAxis domain={[0, 100]} tick={axisStyle} axisLine={false} tickLine={false} tickFormatter={v => `${v}%`} width={40} />
             <Tooltip content={<UtilTooltip />} cursor={{ fill: 'rgba(59,130,246,0.06)' }} />
             
-            {/* 底層：綜合資金利用率 (深藍) */}
-            <Bar dataKey="utilCurrentRender" stackId="util" fill="#3b82f6" maxBarSize={32} />
-            {/* 頂層：借出當下資金利用率差額 (淺藍)，總高維持為歷史利用率 */}
-            <Bar dataKey="utilDiff" stackId="util" fill="#bfdbfe" radius={[4, 4, 0, 0]} maxBarSize={32} />
+            {/* 底層：歷史當天實際借出的利用率 (深藍) */}
+            <Bar dataKey="utilization" stackId="util" fill="#3b82f6" maxBarSize={32} />
+            {/* 頂層：歷史當天的閒置資金比例 (淺藍)，加起來永遠是 100% */}
+            <Bar dataKey="idleUtil" stackId="util" fill="#bfdbfe" radius={[4, 4, 0, 0]} maxBarSize={32} />
             
             <Legend
               content={() => (
                 <div className="flex items-center justify-center gap-5 mt-3 text-xs text-gray-500">
                   <div className="flex items-center gap-1.5">
                     <div className="w-3 h-3 rounded-sm bg-[#3b82f6]" />
-                    <span>綜合換算 (現有本金)</span>
+                    <span>實際利用率</span>
                   </div>
                   <div className="flex items-center gap-1.5">
                     <div className="w-3 h-3 rounded-sm bg-[#bfdbfe]" />
-                    <span>借出當下換算 (歷史本金)</span>
+                    <span>閒置 / 未成交</span>
                   </div>
                 </div>
               )}
