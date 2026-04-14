@@ -33,8 +33,13 @@ const WINDOW_MS = 24 * 60 * 60 * 1000
 const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
 const BUCKET_MS = 30 * 60 * 1000 // 時間 bucket 大小：30 分鐘
 const WINDOW_BUCKETS = Math.ceil(WINDOW_MS / BUCKET_MS) // 48 buckets
-const TIME_WEIGHT_MIN = 0.5 // 最舊 bucket（24h 前）的時間權重
-const TIME_WEIGHT_MAX = 1.0 // 最新 bucket 的時間權重
+const WEIGHT_SCALE = 1_000_000n       // 時間權重精度 1e-6
+const RATE_SCALE = 100_000_000n       // 利率精度 1e-8
+const TIME_WEIGHT_MIN_BI = 850_000n   // 些微衰減：0.85（24h 前的 bucket）
+const TIME_WEIGHT_MAX_BI = 1_000_000n // 最新 bucket：1.0
+// 供 diagnostic log 使用
+const TIME_WEIGHT_MIN = Number(TIME_WEIGHT_MIN_BI) / 1e6
+const TIME_WEIGHT_MAX = Number(TIME_WEIGHT_MAX_BI) / 1e6
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -45,58 +50,90 @@ function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
 }
 
-// 線性時間權重：依 30 分鐘 bucket 分組，最新 = TIME_WEIGHT_MAX，最舊 = TIME_WEIGHT_MIN
-function linearTimeWeight (mts: number, nowTs: number): number {
-  const bucketIndex = Math.floor((nowTs - mts) / BUCKET_MS)
-  const t = Math.min(bucketIndex / (WINDOW_BUCKETS - 1), 1)
-  return TIME_WEIGHT_MAX - (TIME_WEIGHT_MAX - TIME_WEIGHT_MIN) * t
+;(BigInt as any).prototype.toJSON ??= function () { return this.toString() }
+
+function bigintAbs (a: bigint): bigint {
+  return a < 0n ? -a : a
 }
 
-interface RangeEntry { low: number, high: number, vol: number }
+// 線性時間權重（BigInt 版）：最新 bucket = TIME_WEIGHT_MAX_BI，24h 前 = TIME_WEIGHT_MIN_BI
+function linearTimeWeightBI (mts: number, nowTs: number): bigint {
+  const bucketIndex = Math.min(
+    Math.max(Math.floor((nowTs - mts) / BUCKET_MS), 0),
+    WINDOW_BUCKETS - 1,
+  )
+  const decay = (TIME_WEIGHT_MAX_BI - TIME_WEIGHT_MIN_BI) * BigInt(bucketIndex) / BigInt(WINDOW_BUCKETS - 1)
+  return TIME_WEIGHT_MAX_BI - decay
+}
 
-// 把蠟燭轉成 [low, high, vol] 區間，合併相同區間，以成交量 × 時間權重為量
-function buildRanges (
+interface RangeEntryBI { low: bigint, high: bigint, vol: bigint }
+
+// 把蠟燭轉成 [low, high, vol] BigInt 區間，合併相同區間，成交量 × 時間權重
+function buildRangesBI (
   candles: Array<{ mts: Date, open: number, close: number, high: number, low: number, volume: number }>,
   nowTs: number,
   applyTimeWeight: boolean,
-): RangeEntry[] {
-  const rangeMap = new Map<string, number>()
+): RangeEntryBI[] {
+  const rangeMap = new Map<string, bigint>()
   for (const c of candles) {
     if (c.volume <= 0) continue
-    const low = _.round(_.min([c.open, c.close, c.high, c.low])!, 8)
-    const high = _.round(_.max([c.open, c.close, c.high, c.low])!, 8)
-    if (high <= 0 || low <= 0) continue
-    const tw = applyTimeWeight ? linearTimeWeight(+c.mts, nowTs) : 1.0
+    const lowN = _.min([c.open, c.close, c.high, c.low])!
+    const highN = _.max([c.open, c.close, c.high, c.low])!
+    if (highN <= 0 || lowN <= 0) continue
+    const low = BigInt(_.round(lowN * 1e8))
+    const high = BigInt(_.round(highN * 1e8))
+    const volBI = BigInt(_.round(c.volume * 1e8))
+    const tw = applyTimeWeight ? linearTimeWeightBI(+c.mts, nowTs) : WEIGHT_SCALE
+    const weightedVol = volBI * tw / WEIGHT_SCALE
+    if (weightedVol <= 0n) continue
     const key = `${low}|${high}`
-    rangeMap.set(key, (rangeMap.get(key) ?? 0) + c.volume * tw)
+    rangeMap.set(key, (rangeMap.get(key) ?? 0n) + weightedVol)
   }
   return [...rangeMap.entries()]
-    .map(([key, vol]) => { const [low, high] = key.split('|').map(Number); return { low, high, vol } })
-    .filter(r => r.vol > 0)
-    .sort((a, b) => a.low !== b.low ? a.low - b.low : a.high - b.high)
+    .map(([key, vol]) => {
+      const [lowStr, highStr] = key.split('|')
+      return { low: BigInt(lowStr), high: BigInt(highStr), vol }
+    })
+    .filter(r => r.vol > 0n)
+    .sort((a, b) =>
+      a.low !== b.low
+        ? (a.low < b.low ? -1 : 1)
+        : (a.high < b.high ? -1 : a.high > b.high ? 1 : 0))
 }
 
-// 二分搜尋：找出累積加權體積 = totalVol * rank 的利率
-function binarySearchRate (ranges: RangeEntry[], totalVol: number, rank: number): number {
-  if (ranges.length === 0 || totalVol <= 0) return 0
-  const targetVol = totalVol * rank
+// 二分搜尋（BigInt 版，含 +1n 端點修正）：找出累積加權體積 ≈ totalVol * rank 的利率
+function binarySearchRateBI (
+  ranges: RangeEntryBI[],
+  totalVol: bigint,
+  rank: bigint, // 單位 RATE_SCALE (1e8)，例如 rank=0.8 → 80_000_000n
+): bigint {
+  if (ranges.length === 0 || totalVol <= 0n) return 0n
   let lo = ranges[0].low
-  let hi = ranges[ranges.length - 1].high
+  let hi = ranges[0].high
+  for (const r of ranges) {
+    if (r.low < lo) lo = r.low
+    if (r.high > hi) hi = r.high
+  }
   let bestRate = lo
-  let bestDiff = Infinity
-  for (let iter = 0; iter < 100; iter++) {
-    const mid = (lo + hi) / 2
-    if (mid === lo || mid === hi) break
-    let midVol = 0
+  let bestDiff: bigint | null = null
+  while (lo <= hi) {
+    const mid = (lo + hi) / 2n
+    let midVol = 0n
     for (const { low, high, vol } of ranges) {
       if (mid < low) break
-      midVol += mid >= high ? vol : vol * (mid - low) / (high - low)
+      midVol += mid >= high
+        ? vol
+        : vol * (mid - low + 1n) / (high - low + 1n)
     }
-    const diff = Math.abs(midVol - targetVol)
-    if (diff < bestDiff) { bestDiff = diff; bestRate = mid }
-    if (midVol === targetVol) break
-    if (targetVol < midVol) hi = mid
-    else lo = mid
+    const midRank = midVol * RATE_SCALE / totalVol
+    const diff = bigintAbs(midRank - rank)
+    if (bestDiff === null || diff < bestDiff) {
+      bestDiff = diff
+      bestRate = mid
+    }
+    if (midRank === rank) break
+    if (rank < midRank) hi = mid - 1n
+    else lo = mid + 1n
   }
   return bestRate
 }
@@ -188,10 +225,10 @@ export async function main (): Promise<void> {
         })
 
         const validCandles = candles.filter(c => c.volume > 0 && c.high > 0)
-        const weightedRanges = buildRanges(validCandles, now, true)
-        const rawRanges = buildRanges(validCandles, now, false)
-        const totalWeightedVol = _.sumBy(weightedRanges, 'vol')
-        const totalRawVol = _.sumBy(rawRanges, 'vol')
+        const weightedRanges = buildRangesBI(validCandles, now, true)
+        const rawRanges = buildRangesBI(validCandles, now, false)
+        const totalWeightedVol = weightedRanges.reduce((s, r) => s + r.vol, 0n)
+        const totalRawVol = rawRanges.reduce((s, r) => s + r.vol, 0n)
 
         const newestCandleTs = validCandles[0] != null ? +validCandles[0].mts : null
         const oldestCandleTs = validCandles.at(-1) != null ? +validCandles.at(-1)!.mts : null
@@ -208,17 +245,19 @@ export async function main (): Promise<void> {
           lastValidCandle: oldestCandleTs != null ? dayjs(oldestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
           actualSpanHours,
           missingMinutesApprox: _.max([0, 1440 - validCandles.length]),
-          lowestRate: weightedRanges[0] != null ? rateStringify(weightedRanges[0].low) : null,
-          highestRate: weightedRanges.at(-1) != null ? rateStringify(weightedRanges.at(-1)!.high) : null,
+          lowestRate: weightedRanges[0] != null ? rateStringify(Number(weightedRanges[0].low) / 1e8) : null,
+          highestRate: weightedRanges.at(-1) != null ? rateStringify(Number(weightedRanges.at(-1)!.high) / 1e8) : null,
           timeWeightRange: `${TIME_WEIGHT_MIN} ~ ${TIME_WEIGHT_MAX} (linear, ${BUCKET_MS / 60000}min buckets)`,
         })
 
-        if (weightedRanges.length === 0 || totalWeightedVol <= 0) {
+        if (weightedRanges.length === 0 || totalWeightedVol <= 0n) {
           throw new SkipError(`[${currency}] No valid candle data in the last 24 hours.`)
         }
 
         const effectiveRank = cfg1.rank
-        const targetRate = binarySearchRate(weightedRanges, totalWeightedVol, effectiveRank)
+        const rankBI = BigInt(_.round(effectiveRank * 1e8))
+        const targetRateBI = binarySearchRateBI(weightedRanges, totalWeightedVol, rankBI)
+        const targetRate = Number(targetRateBI) / 1e8
 
         // === 診斷 log ===
 
@@ -226,23 +265,26 @@ export async function main (): Promise<void> {
         const percentiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99]
         const pctMap: Record<string, string> = {}
         for (const p of percentiles) {
-          pctMap[`p${_.round(p * 100)}`] = rateStringify(binarySearchRate(weightedRanges, totalWeightedVol, p))
+          pctMap[`p${_.round(p * 100)}`] = rateStringify(Number(binarySearchRateBI(weightedRanges, totalWeightedVol, BigInt(_.round(p * 1e8)))) / 1e8)
         }
         ymlDump('distribution', pctMap)
 
         // 2. 利率閾值分析（APR 7.3% 以下視為 FRR 區間）
         const frrThreshold = 0.0002
-        let volBelowThreshold = 0
+        const frrThresholdBI = BigInt(_.round(frrThreshold * 1e8))
+        let volBelowThreshold = 0n
         for (const { low, high, vol } of weightedRanges) {
-          if (frrThreshold < low) break
-          volBelowThreshold += frrThreshold >= high ? vol : vol * (frrThreshold - low) / (high - low)
+          if (frrThresholdBI < low) break
+          volBelowThreshold += frrThresholdBI >= high
+            ? vol
+            : vol * (frrThresholdBI - low + 1n) / (high - low + 1n)
         }
         ymlDump('thresholdAnalysis', {
           frrThreshold: rateStringify(frrThreshold),
-          belowRangeCount: weightedRanges.filter(r => r.low < frrThreshold).length,
-          aboveRangeCount: weightedRanges.filter(r => r.low >= frrThreshold).length,
-          belowVolPct: floatFormatPercent(volBelowThreshold / totalWeightedVol),
-          aboveVolPct: floatFormatPercent((totalWeightedVol - volBelowThreshold) / totalWeightedVol),
+          belowRangeCount: weightedRanges.filter(r => r.low < frrThresholdBI).length,
+          aboveRangeCount: weightedRanges.filter(r => r.low >= frrThresholdBI).length,
+          belowVolPct: floatFormatPercent(Number(volBelowThreshold) / Number(totalWeightedVol)),
+          aboveVolPct: floatFormatPercent(Number(totalWeightedVol - volBelowThreshold) / Number(totalWeightedVol)),
           configRank: cfg1.rank,
           effectiveRank,
         })
@@ -250,7 +292,7 @@ export async function main (): Promise<void> {
         // 3. 無衰減分布對比（等權重 = 每根 K 線 weight 1）
         const rawPctMap: Record<string, string> = {}
         for (const p of percentiles) {
-          rawPctMap[`p${_.round(p * 100)}`] = rateStringify(binarySearchRate(rawRanges, totalRawVol, p))
+          rawPctMap[`p${_.round(p * 100)}`] = rateStringify(Number(binarySearchRateBI(rawRanges, totalRawVol, BigInt(_.round(p * 1e8)))) / 1e8)
         }
         ymlDump('distributionNoDecay', rawPctMap)
 
@@ -344,30 +386,37 @@ export async function main (): Promise<void> {
         // 循序呼叫避免 nonce 衝突
         const creditsRaw = await bitfinex.v2AuthReadFundingCredits({ currency })
         const orders = await bitfinex.v2AuthReadFundingOffers({ currency })
-        const credits = _.chain(creditsRaw)
+        // 先保留數值 rate 供計算，再格式化供顯示
+        const creditsForCalc = _.chain(creditsRaw)
           .filter(({ side }) => side === 1)
           .map(credit => _.pick(credit, ['id', 'amount', 'rate', 'period', 'mtsOpening']))
-          .map(credit => ({
-            ...credit,
-            mtsOpening: dayjs(credit.mtsOpening).utcOffset(8).format('M/D HH:mm'),
-            rate: floatFormatPercent(credit.rate, 6),
-            apr: floatFormatPercent(credit.rate * 365),
-          }))
           .value()
-        const creditsAmountSum = _.sumBy(credits, 'amount')
-        const creditIds = _.sortBy(_.map(credits, 'id'))
+        const creditsAmountSum = _.sumBy(creditsForCalc, 'amount')
+        const creditIds = _.sortBy(_.map(creditsForCalc, 'id'))
         const ordersAmountSum = _.sumBy(orders, 'amount')
+        // 帳戶總金額 = 可用 + 已借出 + 掛單中（避免入金後利用率失真）
+        const totalAmount = wallet.balance + creditsAmountSum + ordersAmountSum
+        // 綜合 APR（基於帳戶總金額的實際年化收益率）
+        const weightedRateSum = _.sumBy(creditsForCalc, c => c.rate * c.amount)
+        const portfolioApr = totalAmount > 0 ? weightedRateSum * 365 / totalAmount : 0
+        const credits = _.map(creditsForCalc, credit => ({
+          ...credit,
+          mtsOpening: dayjs(credit.mtsOpening).utcOffset(8).format('M/D HH:mm'),
+          rate: floatFormatPercent(credit.rate, 6),
+          apr: floatFormatPercent(credit.rate * 365),
+        }))
 
         const nowts = dayjs().utcOffset(8)
         const msgText = [
           telegram.tgMdEscape(`# ${filename}: ${currency} 狀態
 
-投資額: ${floatFormatDecimal(wallet.balance, 3)}
-已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${progressPercent(creditsAmountSum, wallet.balance)})
-掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, wallet.balance)})
+投資額: ${floatFormatDecimal(totalAmount, 3)}
+已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${progressPercent(creditsAmountSum, totalAmount)})
+掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, totalAmount)})
 自動掛單設定:
     利率: ${floatFormatPercent(autoRenew.rate, 6)}
     APR: ${floatFormatPercent(autoRenew.rate * 365)}
+    綜合APR: ${floatFormatPercent(portfolioApr)}
     天數: ${autoRenew.period}`),
           `更新: ${telegram.tgMdEscape(nowts.format('M/D HH:mm'))}\n`,
           '**>```',
@@ -377,10 +426,10 @@ export async function main (): Promise<void> {
 
         const sendAndSave = async () => {
           const res1 = await telegram.sendMessage({ parse_mode: 'MarkdownV2', text: msgText })
-          _.set(db, `notified.${currency}`, { msgId: res1.message_id, balance: wallet.balance, creditIds })
+          _.set(db, `notified.${currency}`, { msgId: res1.message_id, balance: totalAmount, creditIds })
         }
         const reuseMsgId = _.isNumber(db1.msgId)
-          && floatIsEqual(db1.balance, wallet.balance)
+          && floatIsEqual(db1.balance, totalAmount)
           && _.isEqual(db1.creditIds, creditIds)
         if (reuseMsgId) {
           try {
