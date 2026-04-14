@@ -92,7 +92,15 @@ export default function StatusPage () {
 
   const creditsSum = data?.credits.reduce((s, c) => s + c.amount, 0) ?? 0
   const offersSum = data?.offers.reduce((s, o) => s + o.amount, 0) ?? 0
-  const balance = data?.wallet.balance ?? 0
+  const availableBalance = data?.wallet.balance ?? 0
+  
+  // 新增：真正的總資金 = 可用 + 已借出 + 掛單中
+  const totalAmount = availableBalance + creditsSum + offersSum
+
+  // 新增：計算兩種 APR
+  const creditsWeightedRate = data?.credits.reduce((s, c) => s + c.rate * c.amount, 0) ?? 0
+  const borrowedApr = creditsSum > 0 ? (creditsWeightedRate * 365 * 100) / creditsSum : 0
+  const totalApr = totalAmount > 0 ? (creditsWeightedRate * 365 * 100) / totalAmount : 0
 
   const updatedAt = data?.updatedAt
     ? new Date(data.updatedAt).toLocaleString('zh-Hant', {
@@ -144,20 +152,20 @@ export default function StatusPage () {
           <>
             <MetricCard
               label="投資總額"
-              value={balance.toFixed(2)}
-              subtitle={currency}
+              value={totalAmount.toFixed(2)}
+              subtitle={`可用餘額 ${availableBalance.toFixed(2)} · ${currency}`}
               color="neutral"
             />
             <MetricCard
               label="已借出"
               value={creditsSum.toFixed(2)}
-              subtitle={`${pct(creditsSum, balance)} · ${currency}`}
+              subtitle={`${pct(creditsSum, totalAmount)} · ${currency}`}
               color="emerald"
             />
             <MetricCard
               label="掛單中"
               value={offersSum.toFixed(2)}
-              subtitle={`${pct(offersSum, balance)} · ${currency}`}
+              subtitle={`${pct(offersSum, totalAmount)} · ${currency}`}
               color="sky"
             />
           </>
@@ -178,7 +186,13 @@ export default function StatusPage () {
               ))}
             </div>
           ) : (
-            <AutoRenewCard autoRenew={data?.autoRenew ?? null} currency={currency} updatedAt={data?.updatedAt} />
+            <AutoRenewCard 
+              autoRenew={data?.autoRenew ?? null} 
+              currency={currency} 
+              updatedAt={data?.updatedAt} 
+              borrowedApr={borrowedApr}
+              totalApr={totalApr}
+            />
           )}
         </div>
         <div className="lg:col-span-3">
