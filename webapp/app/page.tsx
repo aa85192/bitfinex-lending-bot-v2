@@ -83,7 +83,6 @@ export default function StatusPage () {
     setData(null)
   }
 
-  // 修正投資總額邏輯：wallet.balance 已經是總額，需反推可用餘額
   const totalAmount = data?.wallet.balance ?? 0
   const creditsSum = data?.credits.reduce((s, c) => s + c.amount, 0) ?? 0
   const offersSum = data?.offers.reduce((s, o) => s + o.amount, 0) ?? 0
@@ -199,6 +198,7 @@ export default function StatusPage () {
           records={history}
           loading={historyLoading}
           currency={currency}
+          currentTotalAmount={totalAmount} // 新增：傳入當前總金額做為基準
         />
       </div>
     </div>
