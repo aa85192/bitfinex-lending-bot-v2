@@ -81,7 +81,14 @@ function aggregateRecords (records: HistoryRecord[], grouping: Grouping, current
   }
 
   // 週/月分組邏輯
-  type G = { date: string; label: string; interest: number; sumAprHist: number; sumAprDil: number; sumUtilHist: number; sumUtilDil: number; n: number }
+  type G = {
+    date: string
+    label: string
+    interest: number
+    investment: number
+    lentAmount: number
+    n: number
+  }
   const groups: Record<string, G> = {}
 
   for (const r of records) {
@@ -94,26 +101,26 @@ function aggregateRecords (records: HistoryRecord[], grouping: Grouping, current
       key = r.date.slice(0, 7)
       label = `${parseInt(r.date.slice(5, 7))}月`
     }
-    const g = (groups[key] ??= { date: key, label, interest: 0, sumAprHist: 0, sumAprDil: 0, sumUtilHist: 0, sumUtilDil: 0, n: 0 })
+    const g = (groups[key] ??= { date: key, label, interest: 0, investment: 0, lentAmount: 0, n: 0 })
     
     const histInv = (r as any).investment || 0;
     const histLentAmount = (histInv * r.utilization) / 100;
 
     g.interest += r.interest
-    g.sumAprHist += (r.apr1 || 0)
-    g.sumAprDil += (r.interest * 365 * 100) / safeTotal
-    g.sumUtilHist += (r.utilization || 0)
-    g.sumUtilDil += (histLentAmount / safeTotal) * 100
+    g.investment += histInv
+    g.lentAmount += histLentAmount
     g.n++
   }
 
   return Object.values(groups)
     .sort((a, b) => a.date.localeCompare(b.date))
     .map(g => {
-      const avgAprHist = g.n > 0 ? g.sumAprHist / g.n : 0;
-      const avgAprDil = g.n > 0 ? g.sumAprDil / g.n : 0;
-      const avgUtilHist = g.n > 0 ? g.sumUtilHist / g.n : 0;
-      const avgUtilDil = g.n > 0 ? g.sumUtilDil / g.n : 0;
+      // 週/月分組不要直接平均百分比，改用「先加總分子/分母再換算」
+      // 以避免不同本金日子被同權重平均，造成年化/利用率失真。
+      const avgAprHist = g.investment > 0 ? (g.interest * 365 * 100) / g.investment : 0
+      const avgAprDil = g.n > 0 ? (g.interest * 365 * 100) / (safeTotal * g.n) : 0
+      const avgUtilHist = g.investment > 0 ? (g.lentAmount * 100) / g.investment : 0
+      const avgUtilDil = g.n > 0 ? (g.lentAmount * 100) / (safeTotal * g.n) : 0
 
       return {
         date: g.date,
