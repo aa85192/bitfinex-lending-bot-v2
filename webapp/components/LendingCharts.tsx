@@ -18,12 +18,12 @@ interface ChartPoint {
   
   // APR 相關
   aprTotal: number      // 綜合換算 APR (歷史當天本金)
-  aprLent: number       // 借出當下 APR
+  aprLent: number       // 借出當下真實 APR
   aprDiff: number       // 兩者差額 (用於疊加上層)
 
   // 利用率相關
-  utilization: number   // 綜合換算利用率 (歷史當天)
-  idleUtil: number      // 閒置比例
+  utilization: number   // 歷史當天實際借出利用率
+  idleUtil: number      // 歷史當天閒置比例
 }
 
 function toISO (d: Date) { return d.toISOString().slice(0, 10) }
@@ -42,7 +42,7 @@ function startOfWeek (dateStr: string) {
 function aggregateRecords (records: HistoryRecord[], grouping: Grouping): ChartPoint[] {
   if (grouping === 'day') {
     return records.map(r => {
-      // 數學修正：r.apr1 本身就是用歷史當天「總本金」算出來的「綜合換算 APR」
+      // API 的 apr1 本身就是用歷史當天「總本金」算出來的「綜合換算 APR」
       const aprTotal = r.apr1 || 0;
       const util = r.utilization || 0;
       
@@ -208,6 +208,7 @@ function ChartSkeleton () {
   )
 }
 
+// 注意：這裡已經移除了 currentTotalAmount
 interface LendingChartsProps {
   records: HistoryRecord[]
   loading: boolean
@@ -322,9 +323,9 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
             <YAxis tick={axisStyle} axisLine={false} tickLine={false} tickFormatter={v => `${v.toFixed(1)}%`} width={48} />
             <Tooltip content={<ApyTooltip />} cursor={{ fill: 'rgba(16,185,129,0.06)' }} />
             
-            {/* 底層：綜合 APR (深色實心) */}
+            {/* 底層：綜合 APR (深綠色實心) */}
             <Bar dataKey="aprTotal" stackId="apr" fill="#10b981" maxBarSize={32} />
-            {/* 頂層：借出當下 APR 差額 (淺色半透明)，整根高度為借出當下真實 APR */}
+            {/* 頂層：借出當下 APR 差額 (淺綠色半透明)，疊加上去整根高度為借出當下真實 APR */}
             <Bar dataKey="aprDiff" stackId="apr" fill="#a7f3d0" radius={[4, 4, 0, 0]} maxBarSize={32} />
             
             <Legend
@@ -354,9 +355,9 @@ export default function LendingCharts ({ records, loading, currency }: LendingCh
             <YAxis domain={[0, 100]} tick={axisStyle} axisLine={false} tickLine={false} tickFormatter={v => `${v}%`} width={40} />
             <Tooltip content={<UtilTooltip />} cursor={{ fill: 'rgba(59,130,246,0.06)' }} />
             
-            {/* 底層：歷史當天實際借出的利用率 (深藍) */}
+            {/* 底層：歷史當天實際借出的利用率 (深藍色實心) */}
             <Bar dataKey="utilization" stackId="util" fill="#3b82f6" maxBarSize={32} />
-            {/* 頂層：歷史當天的閒置資金比例 (淺藍)，加起來永遠是 100% */}
+            {/* 頂層：歷史當天的閒置資金比例 (淺藍色)，與底層加起來總高度永遠是 100% */}
             <Bar dataKey="idleUtil" stackId="util" fill="#bfdbfe" radius={[4, 4, 0, 0]} maxBarSize={32} />
             
             <Legend
