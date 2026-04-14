@@ -151,7 +151,6 @@ async function calcUtilizationByDate (currency: string): Promise<Record<string, 
     // 循序呼叫避免 nonce 衝突（並行呼叫會導致 nonce 到達伺服器的順序不一致而被拒絕）
     const histCredits = await bitfinex.v2AuthReadFundingCreditsHist({ currency, limit: 500 })
     const activeCredits = await bitfinex.v2AuthReadFundingCredits({ currency })
-    const offers = await bitfinex.v2AuthReadFundingOffers({ currency })
 
     const now = Date.now()
     const credits = [
@@ -179,14 +178,6 @@ async function calcUtilizationByDate (currency: string): Promise<Record<string, 
         const amountByDay = amount * (overlapEnd - overlapStart) / MS_PER_DAY
         results[date] = _.round((results[date] ?? 0) + amountByDay, 8)
       }
-    }
-
-    // 掛單中的 offers 直接計入今天的利用率
-    const today = dayjs().format('YYYY-MM-DD')
-    for (const offer of offers) {
-      const amount = Math.abs(offer.amount)
-      if (amount <= 0) continue
-      results[today] = _.round((results[today] ?? 0) + amount, 8)
     }
 
     return results
