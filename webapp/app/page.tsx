@@ -43,7 +43,6 @@ export default function StatusPage () {
   const [history, setHistory] = useState<HistoryRecord[]>([])
   const [historyLoading, setHistoryLoading] = useState(true)
 
-  // Fetch current status
   const loadStatus = useCallback(async (cur: string) => {
     setLoading(true)
     setError(null)
@@ -58,7 +57,6 @@ export default function StatusPage () {
     }
   }, [])
 
-  // Fetch history data for charts
   const loadHistory = useCallback(async (cur: string) => {
     setHistoryLoading(true)
     setHistory([])
@@ -67,7 +65,7 @@ export default function StatusPage () {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setHistory(await res.json())
     } catch {
-      // silently ignore — charts will show empty state
+      // silently ignore
     } finally {
       setHistoryLoading(false)
     }
@@ -76,12 +74,7 @@ export default function StatusPage () {
   useEffect(() => {
     loadStatus(currency)
     loadHistory(currency)
-
-    // Auto-refresh current status every 60 seconds
-    const refreshInterval = setInterval(() => {
-      loadStatus(currency)
-    }, 60_000)
-
+    const refreshInterval = setInterval(() => { loadStatus(currency) }, 60_000)
     return () => clearInterval(refreshInterval)
   }, [currency, loadStatus, loadHistory])
 
@@ -90,17 +83,11 @@ export default function StatusPage () {
     setData(null)
   }
 
+  // 修正投資總額邏輯：wallet.balance 已經是總額，需反推可用餘額
+  const totalAmount = data?.wallet.balance ?? 0
   const creditsSum = data?.credits.reduce((s, c) => s + c.amount, 0) ?? 0
   const offersSum = data?.offers.reduce((s, o) => s + o.amount, 0) ?? 0
-  const availableBalance = data?.wallet.balance ?? 0
-  
-  // 新增：真正的總資金 = 可用 + 已借出 + 掛單中
-  const totalAmount = availableBalance + creditsSum + offersSum
-
-  // 新增：計算兩種 APR
-  const creditsWeightedRate = data?.credits.reduce((s, c) => s + c.rate * c.amount, 0) ?? 0
-  const borrowedApr = creditsSum > 0 ? (creditsWeightedRate * 365 * 100) / creditsSum : 0
-  const totalApr = totalAmount > 0 ? (creditsWeightedRate * 365 * 100) / totalAmount : 0
+  const availableBalance = Math.max(0, totalAmount - creditsSum - offersSum)
 
   const updatedAt = data?.updatedAt
     ? new Date(data.updatedAt).toLocaleString('zh-Hant', {
@@ -111,7 +98,6 @@ export default function StatusPage () {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-gray-900">即時狀態</h1>
@@ -144,7 +130,6 @@ export default function StatusPage () {
         </div>
       )}
 
-      {/* Metric cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {loading ? (
           <><SkeletonCard /><SkeletonCard color="bg-emerald-50/60" /><SkeletonCard color="bg-sky-50/60" /></>
@@ -172,7 +157,6 @@ export default function StatusPage () {
         )}
       </div>
 
-      {/* Auto-renew + credits */}
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
         <div className="lg:col-span-1">
           {loading ? (
@@ -186,13 +170,7 @@ export default function StatusPage () {
               ))}
             </div>
           ) : (
-            <AutoRenewCard 
-              autoRenew={data?.autoRenew ?? null} 
-              currency={currency} 
-              updatedAt={data?.updatedAt} 
-              borrowedApr={borrowedApr}
-              totalApr={totalApr}
-            />
+            <AutoRenewCard autoRenew={data?.autoRenew ?? null} currency={currency} updatedAt={data?.updatedAt} />
           )}
         </div>
         <div className="lg:col-span-3">
@@ -215,7 +193,6 @@ export default function StatusPage () {
         </div>
       </div>
 
-      {/* ── Charts section ── */}
       <div>
         <h2 className="text-lg font-semibold text-gray-900 mb-4">收益圖表</h2>
         <LendingCharts
