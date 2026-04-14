@@ -198,6 +198,7 @@ export default function StatusPage () {
           records={history}
           loading={historyLoading}
           currency={currency}
+          currentTotalAmount={totalAmount}
         />
       </div>
     </div>
