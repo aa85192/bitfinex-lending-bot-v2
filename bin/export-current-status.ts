@@ -10,6 +10,10 @@ import { getenv } from '../lib/dotenv.mjs'
 
 import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
 import { promises as fsPromises } from 'node:fs'
+import { gzip } from 'node:zlib'
+import { promisify } from 'node:util'
+
+const gzipAsync = promisify(gzip)
 
 const outdir = new URL('../dist/current-status/', import.meta.url)
 const bitfinex = new Bitfinex({
@@ -78,7 +82,12 @@ async function main (): Promise<void> {
         updatedAt: new Date().toISOString(),
       }
 
-      await writeFile(new URL(`${currency}.json`, outdir), JSON.stringify(data, null, 2))
+      // 生成非压缩和压缩版本（GitHub Pages 会自动使用合适的版本）
+      const jsonStr = JSON.stringify(data)
+      await Promise.all([
+        writeFile(new URL(`${currency}.json`, outdir), jsonStr),
+        writeFileGz(new URL(`${currency}.json.gz`, outdir), jsonStr),
+      ])
       console.log(`[export-current-status] ✓ ${currency}: balance=${data.wallet.balance}, credits=${data.credits.length}, offers=${data.offers.length}`)
     } catch (err) {
       console.error(`[export-current-status] ✗ ${currency} failed:`, err)
@@ -92,6 +101,12 @@ async function main (): Promise<void> {
 async function writeFile (filepath: URL, data: string): Promise<void> {
   await fsPromises.mkdir(new URL('.', filepath), { recursive: true })
   await fsPromises.writeFile(filepath, data)
+}
+
+async function writeFileGz (filepath: URL, data: string): Promise<void> {
+  await fsPromises.mkdir(new URL('.', filepath), { recursive: true })
+  const compressed = await gzipAsync(data)
+  await fsPromises.writeFile(filepath, compressed)
 }
 
 main().catch(err => {

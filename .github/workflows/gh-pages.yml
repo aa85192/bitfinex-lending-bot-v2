@@ -21,17 +21,6 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
     steps:
-      - name: Dump GitHub Context
-        run: |
-          echo 'env=${{ toJSON(env) }}'
-          echo 'github=${{ toJSON(github) }}'
-          echo 'inputs=${{ toJSON(inputs) }}'
-          echo 'job=${{ toJSON(job) }}'
-          echo 'runner=${{ toJSON(runner) }}'
-          echo 'secrets=${{ toJSON(secrets) }}'
-          echo 'steps=${{ toJSON(steps) }}'
-          echo 'vars=${{ toJSON(vars) }}'
-
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -78,9 +67,6 @@ jobs:
     permissions:
       pages: write
       id-token: write
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
-      cancel-in-progress: true
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
