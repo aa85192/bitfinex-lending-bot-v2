@@ -1,3 +1,7 @@
+'use client'
+
+import { useEffect, useState } from 'react'
+
 interface CreditInfo {
   id: number
   amount: number
@@ -11,11 +15,49 @@ function fmtDate(iso: string) {
   return iso.slice(0, 10)
 }
 
+function getDeadline(mtsOpening: string, period: number): Date {
+  return new Date(new Date(mtsOpening).getTime() + period * 24 * 60 * 60 * 1000)
+}
+
+function fmtDeadline(deadline: Date): string {
+  return deadline.toLocaleString('zh-Hant', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function fmtRemaining(deadline: Date, now: Date): { text: string; level: 'expired' | 'urgent' | 'warning' | 'ok' } {
+  const diff = deadline.getTime() - now.getTime()
+  if (diff <= 0) return { text: '已到期', level: 'expired' }
+  const totalMinutes = Math.floor(diff / 60000)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  const text = hours === 0 ? `${minutes} 分` : `${hours} 小時 ${minutes} 分`
+  const level = hours < 2 ? 'urgent' : hours < 24 ? 'warning' : 'ok'
+  return { text, level }
+}
+
+const remainingColor: Record<string, string> = {
+  expired: 'text-red-500 font-medium',
+  urgent: 'text-red-500',
+  warning: 'text-amber-500',
+  ok: 'text-gray-500',
+}
+
 interface CreditsTableProps {
   credits: CreditInfo[]
 }
 
 export default function CreditsTable({ credits }: CreditsTableProps) {
+  const [now, setNow] = useState(() => new Date())
+
+  useEffect(() => {
+    const interval = setInterval(() => setNow(new Date()), 60_000)
+    return () => clearInterval(interval)
+  }, [])
+
   return (
     <div className="card p-0 overflow-hidden">
       <div className="px-6 py-4 border-b border-gray-100">
@@ -35,35 +77,47 @@ export default function CreditsTable({ credits }: CreditsTableProps) {
               <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">年利率</th>
               <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">天數</th>
               <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">開始日期</th>
+              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">歸還期限</th>
+              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">剩餘時間</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-50">
             {credits.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-6 py-8 text-center text-gray-400 text-sm">
+                <td colSpan={7} className="px-6 py-8 text-center text-gray-400 text-sm">
                   目前無出借中訂單
                 </td>
               </tr>
             ) : (
-              credits.map(c => (
-                <tr key={c.id} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-6 py-4 font-medium tabular-nums text-gray-900">
-                    {c.amount.toFixed(2)}
-                  </td>
-                  <td className="px-6 py-4 text-right tabular-nums text-gray-600">
-                    {(c.rate * 100).toFixed(4)}%
-                  </td>
-                  <td className="px-6 py-4 text-right tabular-nums text-emerald-600 font-medium">
-                    {(c.rate * 365 * 100).toFixed(2)}%
-                  </td>
-                  <td className="px-6 py-4 text-right tabular-nums text-gray-600">
-                    {c.period} 天
-                  </td>
-                  <td className="px-6 py-4 text-right tabular-nums text-gray-500">
-                    {fmtDate(c.mtsOpening)}
-                  </td>
-                </tr>
-              ))
+              credits.map(c => {
+                const deadline = getDeadline(c.mtsOpening, c.period)
+                const remaining = fmtRemaining(deadline, now)
+                return (
+                  <tr key={c.id} className="hover:bg-gray-50 transition-colors">
+                    <td className="px-6 py-4 font-medium tabular-nums text-gray-900">
+                      {c.amount.toFixed(2)}
+                    </td>
+                    <td className="px-6 py-4 text-right tabular-nums text-gray-600">
+                      {(c.rate * 100).toFixed(4)}%
+                    </td>
+                    <td className="px-6 py-4 text-right tabular-nums text-emerald-600 font-medium">
+                      {(c.rate * 365 * 100).toFixed(2)}%
+                    </td>
+                    <td className="px-6 py-4 text-right tabular-nums text-gray-600">
+                      {c.period} 天
+                    </td>
+                    <td className="px-6 py-4 text-right tabular-nums text-gray-500">
+                      {fmtDate(c.mtsOpening)}
+                    </td>
+                    <td className="px-6 py-4 text-right tabular-nums text-gray-500">
+                      {fmtDeadline(deadline)}
+                    </td>
+                    <td className={`px-6 py-4 text-right tabular-nums ${remainingColor[remaining.level]}`}>
+                      {remaining.text}
+                    </td>
+                  </tr>
+                )
+              })
             )}
           </tbody>
         </table>
