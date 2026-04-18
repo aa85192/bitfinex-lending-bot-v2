@@ -28,22 +28,13 @@ function fmtDeadline(deadline: Date): string {
   })
 }
 
-function fmtRemaining(deadline: Date, now: Date): { text: string; level: 'expired' | 'urgent' | 'warning' | 'ok' } {
+function fmtRemaining(deadline: Date, now: Date): string {
   const diff = deadline.getTime() - now.getTime()
-  if (diff <= 0) return { text: '已到期', level: 'expired' }
+  if (diff <= 0) return '已到期'
   const totalMinutes = Math.floor(diff / 60000)
   const hours = Math.floor(totalMinutes / 60)
   const minutes = totalMinutes % 60
-  const text = hours === 0 ? `${minutes} 分` : `${hours} 小時 ${minutes} 分`
-  const level = hours < 2 ? 'urgent' : hours < 24 ? 'warning' : 'ok'
-  return { text, level }
-}
-
-const remainingColor: Record<string, string> = {
-  expired: 'text-red-500 font-medium',
-  urgent: 'text-red-500',
-  warning: 'text-amber-500',
-  ok: 'text-gray-500',
+  return hours === 0 ? `${minutes} 分` : `${hours} 小時 ${minutes} 分`
 }
 
 interface CreditsTableProps {
@@ -91,7 +82,7 @@ export default function CreditsTable({ credits }: CreditsTableProps) {
             ) : (
               credits.map(c => {
                 const deadline = getDeadline(c.mtsOpening, c.period)
-                const remaining = fmtRemaining(deadline, now)
+                const remainingText = fmtRemaining(deadline, now)
                 return (
                   <tr key={c.id} className="hover:bg-gray-50 transition-colors">
                     <td className="px-6 py-4 font-medium tabular-nums text-gray-900">
@@ -112,8 +103,8 @@ export default function CreditsTable({ credits }: CreditsTableProps) {
                     <td className="px-6 py-4 text-right tabular-nums text-gray-500">
                       {fmtDeadline(deadline)}
                     </td>
-                    <td className={`px-6 py-4 text-right tabular-nums ${remainingColor[remaining.level]}`}>
-                      {remaining.text}
+                    <td className="px-6 py-4 text-right tabular-nums text-gray-500">
+                      {remainingText}
                     </td>
                   </tr>
                 )
