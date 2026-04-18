@@ -182,7 +182,7 @@ function ApyTooltip ({ active, payload, label }: any) {
   )
 }
 
-function UtilTooltip ({ active, payload, label }: any) {
+function UtilTooltip ({ active, payload, label, isUsd }: any) {
   if (!active || !payload?.length) return null
   const data = payload[0].payload as ChartPoint
   return (
@@ -190,18 +190,20 @@ function UtilTooltip ({ active, payload, label }: any) {
       <p className="text-gray-500 mb-1 border-b border-gray-50 pb-1">{label}</p>
       <div className="flex justify-between items-center gap-4">
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm bg-blue-200" />
-          <span className="text-gray-500">借出當下利用率 (歷史)</span>
+          <div className="w-2 h-2 rounded-sm bg-blue-500" />
+          <span className="text-gray-500">借出當下利用率</span>
         </div>
         <span className="font-semibold text-gray-900">{data.utilHistorical?.toFixed(1)}%</span>
       </div>
-      <div className="flex justify-between items-center gap-4">
-        <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm bg-blue-500" />
-          <span className="text-gray-500">綜合換算利用率 (以今日總金)</span>
+      {!isUsd && (
+        <div className="flex justify-between items-center gap-4">
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-sm bg-blue-200" />
+            <span className="text-gray-500">綜合換算利用率 (以今日總金)</span>
+          </div>
+          <span className="font-semibold text-gray-900">{data.utilDilutedTrue?.toFixed(1)}%</span>
         </div>
-        <span className="font-semibold text-gray-900">{data.utilDilutedTrue?.toFixed(1)}%</span>
-      </div>
+      )}
     </div>
   )
 }
@@ -360,7 +362,7 @@ export default function LendingCharts ({ records, loading, currency, currentTota
             <Tooltip content={<ApyTooltip />} cursor={{ fill: 'rgba(16,185,129,0.06)' }} />
             
             {/* 底層：綜合換算 APR (深綠色實心) */}
-            <Bar dataKey="aprBottomRender" stackId="apr" fill="#10b981" maxBarSize={32} />
+            <Bar dataKey="aprBottomRender" stackId="apr" fill="#10b981" radius={[4, 4, 0, 0]} maxBarSize={32} />
             {/* 頂層：借出當下 APR 差額 (淺綠色半透明) */}
             <Bar dataKey="aprTopRender" stackId="apr" fill="#a7f3d0" radius={[4, 4, 0, 0]} maxBarSize={32} />
             
@@ -389,24 +391,40 @@ export default function LendingCharts ({ records, loading, currency, currentTota
             <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#f3f4f6" />
             <XAxis dataKey="label" tick={axisStyle} interval={interval} axisLine={false} tickLine={false} />
             <YAxis domain={[0, 'auto']} tick={axisStyle} axisLine={false} tickLine={false} tickFormatter={v => `${v}%`} width={40} />
-            <Tooltip content={<UtilTooltip />} cursor={{ fill: 'rgba(59,130,246,0.06)' }} />
-            
-            {/* 底層：綜合換算資金利用率 (深藍色實心) */}
-            <Bar dataKey="utilBottomRender" stackId="util" fill="#3b82f6" maxBarSize={32} />
-            {/* 頂層：歷史當下借出利用率的差額 (淺藍色) */}
-            <Bar dataKey="utilTopRender" stackId="util" fill="#bfdbfe" radius={[4, 4, 0, 0]} maxBarSize={32} />
-            
+            <Tooltip content={(props) => <UtilTooltip {...props} isUsd={currency === 'USD'} />} cursor={{ fill: 'rgba(59,130,246,0.06)' }} />
+
+            {currency === 'USD' ? (
+              /* USD：只顯示借出當下利用率 */
+              <Bar dataKey="utilHistorical" fill="#3b82f6" radius={[4, 4, 0, 0]} maxBarSize={32} />
+            ) : (
+              <>
+                {/* 底層：綜合換算資金利用率 (深藍色實心) */}
+                <Bar dataKey="utilBottomRender" stackId="util" fill="#3b82f6" radius={[4, 4, 0, 0]} maxBarSize={32} />
+                {/* 頂層：歷史當下借出利用率的差額 (淺藍色) */}
+                <Bar dataKey="utilTopRender" stackId="util" fill="#bfdbfe" radius={[4, 4, 0, 0]} maxBarSize={32} />
+              </>
+            )}
+
             <Legend
               content={() => (
                 <div className="flex items-center justify-center gap-5 mt-3 text-xs text-gray-500">
-                  <div className="flex items-center gap-1.5">
-                    <div className="w-3 h-3 rounded-sm bg-[#3b82f6]" />
-                    <span>綜合換算利用率 (以目前總金)</span>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <div className="w-3 h-3 rounded-sm bg-[#bfdbfe]" />
-                    <span>借出當下利用率 (總高度)</span>
-                  </div>
+                  {currency === 'USD' ? (
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-3 h-3 rounded-sm bg-[#3b82f6]" />
+                      <span>借出當下利用率</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-3 h-3 rounded-sm bg-[#3b82f6]" />
+                        <span>綜合換算利用率 (以目前總金)</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-3 h-3 rounded-sm bg-[#bfdbfe]" />
+                        <span>借出當下利用率 (總高度)</span>
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
             />
