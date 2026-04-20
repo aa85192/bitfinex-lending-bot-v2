@@ -359,13 +359,21 @@ export async function main (): Promise<void> {
         }
         ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate) })
 
-        if (_.isMatch(prevAutoRenew ?? {}, newAutoRenew)) {
+        const walletAvailable = (wallets[`funding:${currency}`] as any)?.availableBalance ?? 0
+        const settingsChanged = !_.isMatch(prevAutoRenew ?? {}, newAutoRenew)
+
+        if (!settingsChanged && walletAvailable < 1) {
           trace.autoRenewChanged = false
           loggers.log('Setting of auto-renew no change.')
         } else {
           trace.autoRenewChanged = true
-          if (!_.isNil(prevAutoRenew)) await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
-          await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
+          if (settingsChanged) {
+            if (!_.isNil(prevAutoRenew)) await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
+            await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
+          } else {
+            // 設定未變，但有閒置資金（如到期歸還），直接觸發自動掛單讓 Bitfinex 重新建立掛單
+            loggers.log(`Available balance ${floatFormatDecimal(walletAvailable, 2)}, re-triggering auto-funding`)
+          }
           await bitfinex.v2AuthWriteFundingAuto({
             ...newAutoRenew,
             rate: floatFloor8(newAutoRenew.rate * 100), // API 要的是百分比
@@ -395,7 +403,8 @@ export async function main (): Promise<void> {
         const creditIds = _.sortBy(_.map(creditsForCalc, 'id'))
         const ordersAmountSum = _.sumBy(orders, 'amount')
         // 帳戶總金額 = 可用 + 已借出 + 掛單中（避免入金後利用率失真）
-        const totalAmount = wallet.balance + creditsAmountSum + ordersAmountSum
+        // wallet.balance 是 Bitfinex 總餘額（含已借出與掛單），需用 availableBalance（可用）加上已部署金額
+        const totalAmount = ((wallet as any).availableBalance ?? 0) + creditsAmountSum + ordersAmountSum
         // 綜合 APR（基於帳戶總金額）、借出 APR（僅借出部分，不受入金稀釋）
         const weightedRateSum = _.sumBy(creditsForCalc, c => c.rate * c.amount)
         const portfolioApr = totalAmount > 0 ? weightedRateSum * 365 / totalAmount : 0

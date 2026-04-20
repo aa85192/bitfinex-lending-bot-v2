@@ -62,9 +62,12 @@ async function main (): Promise<void> {
             rate: c.rate,
             period: c.period,
             mtsOpening: (c.mtsOpening instanceof Date ? c.mtsOpening : new Date(c.mtsOpening)).toISOString(),
-            mtsLastPayout: c.mtsLastPayout
-              ? (c.mtsLastPayout instanceof Date ? c.mtsLastPayout : new Date(c.mtsLastPayout)).toISOString()
-              : null,
+            mtsLastPayout: (() => {
+              const ms = c.mtsLastPayout instanceof Date
+                ? c.mtsLastPayout.getTime()
+                : Number(c.mtsLastPayout)
+              return ms > 0 ? new Date(ms).toISOString() : null
+            })(),
           })),
         offers: (offers as any[]).map((o: any) => ({
           id: o.id,

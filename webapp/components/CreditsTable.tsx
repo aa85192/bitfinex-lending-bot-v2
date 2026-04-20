@@ -30,7 +30,7 @@ function fmtDeadline(deadline: Date): string {
 
 function fmtRemaining(deadline: Date, now: Date): string {
   const diff = deadline.getTime() - now.getTime()
-  if (diff <= 0) return '已到期'
+  if (diff <= 0) return '歸還中'
   const totalMinutes = Math.floor(diff / 60000)
   const hours = Math.floor(totalMinutes / 60)
   const minutes = totalMinutes % 60
@@ -103,7 +103,7 @@ export default function CreditsTable({ credits }: CreditsTableProps) {
                     <td className="px-6 py-4 text-right tabular-nums text-gray-500">
                       {fmtDeadline(deadline)}
                     </td>
-                    <td className="px-6 py-4 text-right tabular-nums text-gray-500">
+                    <td className={`px-6 py-4 text-right tabular-nums ${remainingText === '歸還中' ? 'text-amber-500 font-medium' : 'text-gray-500'}`}>
                       {remainingText}
                     </td>
                   </tr>
