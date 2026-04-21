@@ -6,6 +6,7 @@ import MetricCard from '@/components/MetricCard'
 import AutoRenewCard from '@/components/AutoRenewCard'
 import CreditsTable from '@/components/CreditsTable'
 import LendingCharts from '@/components/LendingCharts'
+import GithubActionsPanel from '@/components/GithubActionsPanel'
 import type { HistoryRecord } from '@/components/HistoryTable'
 
 const STATUS_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/current-status'
@@ -119,6 +120,8 @@ export default function StatusPage () {
           <CurrencyTabs active={currency} onChange={handleCurrencyChange} />
         </div>
       </div>
+
+      <GithubActionsPanel />
 
       {error && (
         <div className="rounded-xl bg-red-50 border border-red-100 px-4 py-3 text-sm text-red-600">
