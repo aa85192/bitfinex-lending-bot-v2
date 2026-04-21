@@ -15,6 +15,25 @@ import { promisify } from 'node:util'
 
 const gzipAsync = promisify(gzip)
 
+async function withNonceRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (err: any) {
+      const msg = String(err?.message ?? '')
+      const isNonce = msg.includes('10114') || msg.toLowerCase().includes('nonce')
+      if (isNonce && attempt < maxRetries - 1) {
+        const delay = (attempt + 1) * 4000 + Math.random() * 2000
+        console.warn(`[export-current-status] nonce conflict, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt + 2}/${maxRetries})`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      throw err
+    }
+  }
+  throw new Error('unreachable')
+}
+
 const outdir = new URL('../dist/current-status/', import.meta.url)
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
@@ -38,15 +57,15 @@ async function main (): Promise<void> {
     throw new Error('Bitfinex API is in maintenance mode')
   }
 
-  const wallets = await bitfinex.v2AuthReadWallets()
+  const wallets = await withNonceRetry(() => bitfinex.v2AuthReadWallets())
 
   let hasError = false
   for (const currency of currencys) {
     try {
       // 循序呼叫避免 nonce 衝突
-      const credits = await bitfinex.v2AuthReadFundingCredits({ currency })
-      const offers = await bitfinex.v2AuthReadFundingOffers({ currency })
-      const autoRenew = await bitfinex.v2AuthReadFundingAutoStatus({ currency }).catch(() => null)
+      const credits = await withNonceRetry(() => bitfinex.v2AuthReadFundingCredits({ currency }))
+      const offers = await withNonceRetry(() => bitfinex.v2AuthReadFundingOffers({ currency }))
+      const autoRenew = await withNonceRetry(() => bitfinex.v2AuthReadFundingAutoStatus({ currency })).catch(() => null)
 
       const fundingWallet = (wallets as any[]).find(
         (w: any) => w.type === 'funding' && w.currency === currency
