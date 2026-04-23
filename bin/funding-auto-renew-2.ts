@@ -219,7 +219,8 @@ export async function main (): Promise<void> {
   const wallets = _.keyBy(await bitfinex.v2AuthReadWallets(), w => `${w.type}:${w.currency}`)
   const wallet = wallets[`funding:${cfg.currency}`] ?? { balance: 0 }
   const credits = _.filter(await bitfinex.v2AuthReadFundingCredits({ currency: cfg.currency }), c => c.side === 1)
-  const orders = await bitfinex.v2AuthReadFundingOffers({ currency: cfg.currency })
+  // 僅計入出借方向的掛單（amount > 0），與 credits 的 side===1 一致
+  const orders = _.filter(await bitfinex.v2AuthReadFundingOffers({ currency: cfg.currency }), o => o.amount > 0)
   const creditsAmountSum = _.sumBy(credits, 'amount') ?? 0
   const ordersAmountSum = _.sumBy(orders, 'amount') ?? 0
   const creditIds = _.sortBy(_.map(credits, 'id'))

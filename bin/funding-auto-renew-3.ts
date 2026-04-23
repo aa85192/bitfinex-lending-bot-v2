@@ -359,12 +359,21 @@ export async function main (): Promise<void> {
         }
         ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate) })
 
-        const walletAvailable = (wallets[`funding:${currency}`] as any)?.availableBalance ?? 0
+        // 先取實際已部署金額（credits 僅計 side===1 的出借部位；offers 僅計 amount > 0 的出借掛單）
+        // wallet.availableBalance 由 Bitfinex 延遲計算，到期歸還後可能仍為舊值，不可作為判斷依據
+        // 一律以 balance - 已借出 - 掛單中 推導真正的可用餘額，與 webapp 顯示一致
+        const preCreditsRaw = await bitfinex.v2AuthReadFundingCredits({ currency })
+        const preOrders = await bitfinex.v2AuthReadFundingOffers({ currency })
+        const preCreditsSum = _.sumBy(_.filter(preCreditsRaw, ({ side }) => side === 1), 'amount')
+        const preOrdersSum = _.sumBy(_.filter(preOrders, o => o.amount > 0), 'amount')
+        const preBalance = (wallets[`funding:${currency}`] as any)?.balance ?? 0
+        const walletAvailable = Math.max(0, preBalance - preCreditsSum - preOrdersSum)
+        trace.walletAvailable = walletAvailable
         const settingsChanged = !_.isMatch(prevAutoRenew ?? {}, newAutoRenew)
 
         if (!settingsChanged && walletAvailable < 1) {
           trace.autoRenewChanged = false
-          loggers.log('Setting of auto-renew no change.')
+          loggers.log(`Setting of auto-renew no change (available ${floatFormatDecimal(walletAvailable, 2)}).`)
         } else {
           trace.autoRenewChanged = true
           if (settingsChanged) {
@@ -391,7 +400,7 @@ export async function main (): Promise<void> {
         const db1: Record<string, any> = db.notified?.[currency] ?? {}
         const autoRenew = _.pickBy(trace.newAutoRenew, _.isNumber)
 
-        // 循序呼叫避免 nonce 衝突
+        // 重新讀取以反映剛建立／取消的掛單（循序呼叫避免 nonce 衝突）
         const creditsRaw = await bitfinex.v2AuthReadFundingCredits({ currency })
         const orders = await bitfinex.v2AuthReadFundingOffers({ currency })
         // 先保留數值 rate 供計算，再格式化供顯示
@@ -401,10 +410,13 @@ export async function main (): Promise<void> {
           .value()
         const creditsAmountSum = _.sumBy(creditsForCalc, 'amount')
         const creditIds = _.sortBy(_.map(creditsForCalc, 'id'))
-        const ordersAmountSum = _.sumBy(orders, 'amount')
-        // 帳戶總金額 = 可用 + 已借出 + 掛單中（避免入金後利用率失真）
-        // wallet.balance 是 Bitfinex 總餘額（含已借出與掛單），需用 availableBalance（可用）加上已部署金額
-        const totalAmount = ((wallet as any).availableBalance ?? 0) + creditsAmountSum + ordersAmountSum
+        // 僅計入出借方向（amount > 0）的掛單；借款方向 amount 為負
+        const ordersForCalc = _.filter(orders, o => o.amount > 0)
+        const ordersAmountSum = _.sumBy(ordersForCalc, 'amount')
+        // wallet.balance 是 Bitfinex 總餘額（含可用、已借出、掛單中），為 Funding 帳戶總金額的可靠來源
+        // 不使用 availableBalance（會延遲計算）反推總金額，避免到期歸還瞬間數字錯亂
+        const totalAmount = wallet.balance
+        const availableAmount = Math.max(0, totalAmount - creditsAmountSum - ordersAmountSum)
         // 綜合 APR（基於帳戶總金額）、借出 APR（僅借出部分，不受入金稀釋）
         const weightedRateSum = _.sumBy(creditsForCalc, c => c.rate * c.amount)
         const portfolioApr = totalAmount > 0 ? weightedRateSum * 365 / totalAmount : 0
@@ -423,6 +435,7 @@ export async function main (): Promise<void> {
 投資額: ${floatFormatDecimal(totalAmount, 3)}
 已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${progressPercent(creditsAmountSum, totalAmount)})
 掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, totalAmount)})
+可用中: ${floatFormatDecimal(availableAmount, 3)} (${progressPercent(availableAmount, totalAmount)})
 自動掛單設定:
     利率: ${floatFormatPercent(autoRenew.rate, 6)}
     APR: ${floatFormatPercent(autoRenew.rate * 365)}

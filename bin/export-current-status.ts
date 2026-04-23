@@ -88,12 +88,15 @@ async function main (): Promise<void> {
               return ms > 0 ? new Date(ms).toISOString() : null
             })(),
           })),
-        offers: (offers as any[]).map((o: any) => ({
-          id: o.id,
-          amount: Math.abs(o.amount),
-          rate: o.rate,
-          period: o.period,
-        })),
+        // 僅匯出出借方向的掛單（amount > 0）；若使用者同時有借款掛單（amount < 0），不納入利用率計算
+        offers: (offers as any[])
+          .filter((o: any) => o.amount > 0)
+          .map((o: any) => ({
+            id: o.id,
+            amount: o.amount,
+            rate: o.rate,
+            period: o.period,
+          })),
         autoRenew: autoRenew != null
           ? {
               rate: (autoRenew as any).rate ?? 0,
