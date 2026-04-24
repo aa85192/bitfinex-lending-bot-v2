@@ -146,6 +146,10 @@ const ZodConfigPeriod = z.record(
 const ZodConfigCurrency = z.object({
   amount: z.coerce.number().min(0).default(0),
   rank: z.coerce.number().min(0).max(1).default(0.8),
+  rankSplit: z.array(z.object({
+    ratio: z.coerce.number().min(0).max(1),
+    rank: z.coerce.number().min(0).max(1),
+  })).default([]),
   rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
   rateMin: z.coerce.number().min(RATE_MIN).default(0.0002),
   period: ZodConfigPeriod,
@@ -166,6 +170,14 @@ const ZodDb = z.object({
 }).catch({ schema: 1 })
 
 class SkipError extends Error {}
+
+function resolveEffectiveRank (cfg1: z.output<typeof ZodConfigCurrency>): number {
+  if (cfg1.rankSplit.length === 0) return cfg1.rank
+  const ratioSum = _.sumBy(cfg1.rankSplit, 'ratio')
+  if (ratioSum <= 0) return cfg1.rank
+  const normalized = cfg1.rankSplit.map(item => ({ ...item, ratio: item.ratio / ratioSum }))
+  return _.sumBy(normalized, item => item.rank * item.ratio)
+}
 
 export async function main (): Promise<void> {
   if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
@@ -193,6 +205,7 @@ export async function main (): Promise<void> {
       ymlDump(`cfg.${currency}`, {
         currency,
         ...cfg1,
+        rankSplitRatioSum: _.sumBy(cfg1.rankSplit, 'ratio'),
         rateMinStr: rateStringify(cfg1.rateMin),
         rateMaxStr: rateStringify(cfg1.rateMax),
       })
@@ -254,7 +267,7 @@ export async function main (): Promise<void> {
           throw new SkipError(`[${currency}] No valid candle data in the last 24 hours.`)
         }
 
-        const effectiveRank = cfg1.rank
+        const effectiveRank = resolveEffectiveRank(cfg1)
         const rankBI = BigInt(_.round(effectiveRank * 1e8))
         const targetRateBI = binarySearchRateBI(weightedRanges, totalWeightedVol, rankBI)
         const targetRate = Number(targetRateBI) / 1e8
