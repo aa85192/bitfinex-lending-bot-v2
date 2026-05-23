@@ -1,0 +1,41 @@
+[Unit]
+Description=Bitfinex Lending Bot (real-time daemon)
+Documentation=https://github.com/aa85192/bitfinex-lending-bot-v2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@BOT_USER@
+Group=@BOT_USER@
+WorkingDirectory=@INSTALL_DIR@
+EnvironmentFile=@INSTALL_DIR@/.env
+ExecStart=/usr/bin/node --enable-source-maps node_modules/.bin/tsx bot/daemon.ts
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bitfinex-bot
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@INSTALL_DIR@/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# Resource limits suited for e2-micro (1 vCPU, 1 GiB)
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
