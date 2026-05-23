@@ -172,6 +172,42 @@ SLIPIO_DOMAIN="${EXT_IP//./-}.sslip.io"
 
 VIEWER_TOKEN="${VIEWER_TOKEN_FROM_SM:-$(openssl rand -hex 16)}"
 
+# strategy config file (optional, default empty)
+STRATEGY_CONFIG_FILE_DEFAULT="${INSTALL_DIR}/strategy.yaml"
+if [[ ! -f "$STRATEGY_CONFIG_FILE_DEFAULT" ]]; then
+  install -o "$BOT_USER" -g "$BOT_USER" -m 600 /dev/stdin "$STRATEGY_CONFIG_FILE_DEFAULT" <<'YAML_EOF'
+# Reactive-trading strategy config. Same shape as INPUT_AUTO_RENEW_3 in the
+# GitHub Actions workflow. Each currency block tells the daemon how to size,
+# rank-percentile, and pick the period for funding orders.
+#
+# This file is loaded ONLY when STRATEGY_MODE != off in .env.
+#
+# To enable:
+#   1. Edit this file to set your currencies + params
+#   2. Edit .env: STRATEGY_MODE=dry_run  (or =live once you trust it)
+#   3. sudo systemctl restart bitfinex-bot
+#
+# Default content is empty -> engine stays off even with mode set.
+
+# Example (uncomment and customise):
+# USD:
+#   amount: 0           # 0 = use entire available balance
+#   rank: 0.8           # target the p80 of weighted candle volume
+#   rankSplit:          # optional: mixed-rank deployment
+#     - ratio: 0.3
+#       rank: 0.6
+#     - ratio: 0.7
+#       rank: 0.8
+#   rateMin: 0.0001     # ≈ 3.65% APR floor
+#   rateMax: 0.01       # ≈ 365% APR ceiling
+#   period:             # rate → period (days) mapping
+#     3: 0.00027397
+#     7: 0.00041096
+#     15: 0.00056751
+#     30: 0.00082192
+YAML_EOF
+fi
+
 # ─── 8. write .env ────────────────────────────────────────────────────
 log "writing $ENV_FILE"
 TMP_ENV="$(mktemp)"
@@ -190,17 +226,43 @@ VIEWER_TOKEN=${VIEWER_TOKEN}
 PUBLIC_ORIGIN=*
 RATE_ALERT_THRESHOLD=0.0006
 LARGE_TRADE_MIN_AMOUNT=50000
+# Reactive trading (Phase 4)
+# mode: off (default, only monitors) | dry_run (compute decisions, log only) | live (actually trade)
+STRATEGY_MODE=off
+STRATEGY_CONFIG_FILE=${STRATEGY_CONFIG_FILE_DEFAULT}
+STRATEGY_DEBOUNCE_MS=1500
+STRATEGY_CANDLE_REFRESH_MS=60000
+STRATEGY_STATUS_REFRESH_MS=300000
+STRATEGY_WARMUP_MS=60000
+STRATEGY_MIN_INTERVAL_MS=30000
+STRATEGY_MIN_RATE_CHANGE_PCT=1
+STRATEGY_DAILY_BUDGET=200
+STRATEGY_MIN_AMOUNT_TO_TRADE=1
 DEBUG=app:*
 EOF
 
-# preserve existing values for keys present in the old file (only the ones the
-# user might have customised). Re-merge only if the secret manager returned blank.
-if [[ -f "$ENV_FILE" ]] && [[ -z "$BITFINEX_API_KEY" ]]; then
+# preserve user-edited values from any existing .env:
+#   - bitfinex secrets (only when Secret Manager returned blank this run)
+#   - all STRATEGY_* keys (the user owns the trading mode)
+#   - VIEWER_TOKEN (don't regenerate; that would invalidate iPhone sessions)
+#   - tunable thresholds
+preserve_key () {
+  local line="$1" key="${1%%=*}"
+  if grep -q "^${key}=" "$TMP_ENV"; then
+    # escape regex/replacement metachars
+    local esc
+    esc=$(printf '%s' "$line" | sed -e 's/[\/&]/\\&/g' -e 's/|/\\|/g')
+    sed -i "s|^${key}=.*|${esc}|" "$TMP_ENV"
+  fi
+}
+if [[ -f "$ENV_FILE" ]]; then
   while IFS= read -r line; do
     case "$line" in
       BITFINEX_API_KEY=*|BITFINEX_API_SECRET=*|BITFINEX_AFF_CODE=*)
-        key="${line%%=*}"
-        sed -i "s|^${key}=.*|${line}|" "$TMP_ENV"
+        [[ -z "$BITFINEX_API_KEY" ]] && preserve_key "$line"
+        ;;
+      VIEWER_TOKEN=*|STRATEGY_*|RATE_ALERT_THRESHOLD=*|LARGE_TRADE_MIN_AMOUNT=*|BOT_CURRENCIES=*|VAPID_*)
+        preserve_key "$line"
         ;;
     esac
   done < "$ENV_FILE"

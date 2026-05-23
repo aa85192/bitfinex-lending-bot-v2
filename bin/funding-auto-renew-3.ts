@@ -24,22 +24,25 @@ import { dayjs } from '../lib/dayjs.mjs'
 import { floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
 import * as telegram from '../lib/telegram.mjs'
+import {
+  RATE_MIN,
+  WINDOW_MS,
+  RECENT_WINDOW_MS,
+  BUCKET_MS,
+  TIME_WEIGHT_MIN,
+  TIME_WEIGHT_MAX,
+  ZodConfig,
+  ZodConfigPeriod,
+  ZodConfigCurrency,
+  buildRangesBI,
+  binarySearchRateBI,
+  resolveEffectiveRank,
+  rateToPeriod,
+} from '../bot/strategy/rateCalculator.ts'
 
 const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
 const DB_KEY = `api:wtkuo_${filename}`
-const RATE_MIN = 0.0001 // APR 3.65%
-const WINDOW_MS = 24 * 60 * 60 * 1000
-const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
-const BUCKET_MS = 30 * 60 * 1000 // 時間 bucket 大小：30 分鐘
-const WINDOW_BUCKETS = Math.ceil(WINDOW_MS / BUCKET_MS) // 48 buckets
-const WEIGHT_SCALE = 1_000_000n       // 時間權重精度 1e-6
-const RATE_SCALE = 100_000_000n       // 利率精度 1e-8
-const TIME_WEIGHT_MIN_BI = 850_000n   // 些微衰減：0.85（24h 前的 bucket）
-const TIME_WEIGHT_MAX_BI = 1_000_000n // 最新 bucket：1.0
-// 供 diagnostic log 使用
-const TIME_WEIGHT_MIN = Number(TIME_WEIGHT_MIN_BI) / 1e6
-const TIME_WEIGHT_MAX = Number(TIME_WEIGHT_MAX_BI) / 1e6
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -51,111 +54,6 @@ function ymlDump (key: string, val: any): void {
 }
 
 ;(BigInt as any).prototype.toJSON ??= function () { return this.toString() }
-
-function bigintAbs (a: bigint): bigint {
-  return a < 0n ? -a : a
-}
-
-// 線性時間權重（BigInt 版）：最新 bucket = TIME_WEIGHT_MAX_BI，24h 前 = TIME_WEIGHT_MIN_BI
-function linearTimeWeightBI (mts: number, nowTs: number): bigint {
-  const bucketIndex = Math.min(
-    Math.max(Math.floor((nowTs - mts) / BUCKET_MS), 0),
-    WINDOW_BUCKETS - 1,
-  )
-  const decay = (TIME_WEIGHT_MAX_BI - TIME_WEIGHT_MIN_BI) * BigInt(bucketIndex) / BigInt(WINDOW_BUCKETS - 1)
-  return TIME_WEIGHT_MAX_BI - decay
-}
-
-interface RangeEntryBI { low: bigint, high: bigint, vol: bigint }
-
-// 把蠟燭轉成 [low, high, vol] BigInt 區間，合併相同區間，成交量 × 時間權重
-function buildRangesBI (
-  candles: Array<{ mts: Date, open: number, close: number, high: number, low: number, volume: number }>,
-  nowTs: number,
-  applyTimeWeight: boolean,
-): RangeEntryBI[] {
-  const rangeMap = new Map<string, bigint>()
-  for (const c of candles) {
-    if (c.volume <= 0) continue
-    const lowN = _.min([c.open, c.close, c.high, c.low])!
-    const highN = _.max([c.open, c.close, c.high, c.low])!
-    if (highN <= 0 || lowN <= 0) continue
-    const low = BigInt(_.round(lowN * 1e8))
-    const high = BigInt(_.round(highN * 1e8))
-    const volBI = BigInt(_.round(c.volume * 1e8))
-    const tw = applyTimeWeight ? linearTimeWeightBI(+c.mts, nowTs) : WEIGHT_SCALE
-    const weightedVol = volBI * tw / WEIGHT_SCALE
-    if (weightedVol <= 0n) continue
-    const key = `${low}|${high}`
-    rangeMap.set(key, (rangeMap.get(key) ?? 0n) + weightedVol)
-  }
-  return [...rangeMap.entries()]
-    .map(([key, vol]) => {
-      const [lowStr, highStr] = key.split('|')
-      return { low: BigInt(lowStr), high: BigInt(highStr), vol }
-    })
-    .filter(r => r.vol > 0n)
-    .sort((a, b) =>
-      a.low !== b.low
-        ? (a.low < b.low ? -1 : 1)
-        : (a.high < b.high ? -1 : a.high > b.high ? 1 : 0))
-}
-
-// 二分搜尋（BigInt 版，含 +1n 端點修正）：找出累積加權體積 ≈ totalVol * rank 的利率
-function binarySearchRateBI (
-  ranges: RangeEntryBI[],
-  totalVol: bigint,
-  rank: bigint, // 單位 RATE_SCALE (1e8)，例如 rank=0.8 → 80_000_000n
-): bigint {
-  if (ranges.length === 0 || totalVol <= 0n) return 0n
-  let lo = ranges[0].low
-  let hi = ranges[0].high
-  for (const r of ranges) {
-    if (r.low < lo) lo = r.low
-    if (r.high > hi) hi = r.high
-  }
-  let bestRate = lo
-  let bestDiff: bigint | null = null
-  while (lo <= hi) {
-    const mid = (lo + hi) / 2n
-    let midVol = 0n
-    for (const { low, high, vol } of ranges) {
-      if (mid < low) break
-      midVol += mid >= high
-        ? vol
-        : vol * (mid - low + 1n) / (high - low + 1n)
-    }
-    const midRank = midVol * RATE_SCALE / totalVol
-    const diff = bigintAbs(midRank - rank)
-    if (bestDiff === null || diff < bestDiff) {
-      bestDiff = diff
-      bestRate = mid
-    }
-    if (midRank === rank) break
-    if (rank < midRank) hi = mid - 1n
-    else lo = mid + 1n
-  }
-  return bestRate
-}
-
-const ZodConfigPeriod = z.record(
-  z.coerce.number().int().min(2).max(120),
-  z.number().positive(),
-).default({})
-
-const ZodConfigCurrency = z.object({
-  amount: z.coerce.number().min(0).default(0),
-  rank: z.coerce.number().min(0).max(1).default(0.8),
-  rankSplit: z.array(z.object({
-    ratio: z.coerce.number().min(0).max(1),
-    rank: z.coerce.number().min(0).max(1),
-  })).default([]),
-  rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
-  rateMin: z.coerce.number().min(RATE_MIN).default(0.0002),
-  period: ZodConfigPeriod,
-})
-
-const ZodConfig = z.record(z.string(), ZodConfigCurrency).default({})
 
 const ZodDb = z.object({
   schema: z.literal(1),
@@ -170,14 +68,6 @@ const ZodDb = z.object({
 }).catch({ schema: 1 })
 
 class SkipError extends Error {}
-
-function resolveEffectiveRank (cfg1: z.output<typeof ZodConfigCurrency>): number {
-  if (cfg1.rankSplit.length === 0) return cfg1.rank
-  const ratioSum = _.sumBy(cfg1.rankSplit, 'ratio')
-  if (ratioSum <= 0) return cfg1.rank
-  const normalized = cfg1.rankSplit.map(item => ({ ...item, ratio: item.ratio / ratioSum }))
-  return _.sumBy(normalized, item => item.rank * item.ratio)
-}
 
 export async function main (): Promise<void> {
   if ((await Bitfinex.v2PlatformStatus()).status === PlatformStatus.MAINTENANCE) {
@@ -477,22 +367,6 @@ export async function main (): Promise<void> {
 
   ymlDump('newDb', db)
   await bitfinex.v2AuthWriteSettingsSet({ [DB_KEY]: ZodDb.parse(db) as any }).catch(loggers.error)
-}
-
-export function rateToPeriod (periodMap: z.output<typeof ZodConfigPeriod>, rateTarget: number): number {
-  const ctxPeriod: Record<string, number | null> = { lower: null, target: null, upper: null }
-  for (const entry of _.entries(periodMap)) {
-    const [period, rate] = [_.toSafeInteger(entry[0]), _.toFinite(entry[1])]
-    if (rateTarget >= rate) ctxPeriod.lower = _.max([ctxPeriod.lower ?? period, period])
-    if (rateTarget <= rate) ctxPeriod.upper = _.min([ctxPeriod.upper ?? period, period])
-  }
-
-  if (_.isNil(ctxPeriod.lower)) ctxPeriod.target = 2
-  else if (_.isNil(ctxPeriod.upper)) ctxPeriod.target = ctxPeriod.lower
-  else if (ctxPeriod.lower === ctxPeriod.upper) ctxPeriod.target = ctxPeriod.lower
-  else ctxPeriod.target = Math.trunc(ctxPeriod.lower + (ctxPeriod.upper - ctxPeriod.lower) * (rateTarget - periodMap[ctxPeriod.lower]) / (periodMap[ctxPeriod.upper] - periodMap[ctxPeriod.lower]))
-
-  return _.clamp(ctxPeriod.target, 2, 120)
 }
 
 class NotMainModuleError extends Error {}

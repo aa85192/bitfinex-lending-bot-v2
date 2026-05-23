@@ -163,16 +163,64 @@ ls -la /opt/bitfinex-lending-bot/data/push-subscriptions.json
 
 ---
 
-## 七、保留 / 退役舊系統
+## 七、啟用反應式交易 (Phase 4)
 
-升級到 GCP 後可選:
+daemon 內建 reactive engine,跟 cron 共用同一份策略邏輯(`bot/strategy/rateCalculator.ts`)。
+**預設關閉**,需手動啟用。三段式漸進:
 
-- **可保留** `bin/funding-auto-renew-3.ts`(GitHub Actions 每 10 分鐘的 cron):
-  繼續負責「自動設定 funding rate」邏輯,跟 daemon 互不衝突(daemon 只 **觀察 + 通知**,不下單)
-- **可保留** `bin/funding-statistics-1.ts` + GitHub Pages:webapp 的歷史圖表仍從 GitHub Pages 拉
-- **建議移除** Telegram secrets:把 GitHub Actions secrets 中的 `TELEGRAM_TOKEN`、`TELEGRAM_CHAT_ID` 拿掉,程式會自動 no-op(已支援)
+### Step 1: 編輯策略設定
+```bash
+sudo nano /opt/bitfinex-lending-bot/strategy.yaml
+```
+跟 GitHub Actions 的 `INPUT_AUTO_RENEW_3` 同格式,直接複製過來即可。
 
-下一階段如果要做「事件驅動下單」(看到可口利率就改單搶成交),會把 `funding-auto-renew-3.ts` 的純計算邏輯抽到 `bot/strategy/`,由 daemon 觸發。本次 MVP 不做。
+### Step 2: 切到 dry_run,觀察 48 小時
+```bash
+sudo nano /opt/bitfinex-lending-bot/.env
+# 改 STRATEGY_MODE=dry_run
+sudo systemctl restart bitfinex-bot
+```
+觀察 log:
+```bash
+sudo journalctl -u bitfinex-bot -f | grep -i "dry_run\|engine"
+```
+每次 WS 事件(成交、ticker、自己 wallet/credit/offer 變動)會 debounce 1.5 秒後觸發決策計算。
+log 會印「DRY_RUN would apply」搭配預期下單參數;**不會呼叫 REST**。
+也會收到 `strategy.dry_run` 推播(每分鐘 cooldown,避免洗版)。
+
+對照同時間 cron 的下單行為,若一致 → 進 Step 3。
+
+### Step 3: 切到 live,停掉 cron
+```bash
+sudo nano /opt/bitfinex-lending-bot/.env
+# 改 STRATEGY_MODE=live
+sudo systemctl restart bitfinex-bot
+```
+然後到 GitHub repo:Actions → "WTKuo auto-renew-3: fUSD + fUST" → Disable workflow。
+
+### Safety guards(全部可在 .env 調)
+| 變數 | 預設 | 作用 |
+|---|---|---|
+| `STRATEGY_WARMUP_MS` | 60000 | 啟動 / WS 斷線重連後,60 秒內不下單(等狀態暖機) |
+| `STRATEGY_MIN_INTERVAL_MS` | 30000 | 同一幣別每 30 秒最多 1 次下單 |
+| `STRATEGY_MIN_RATE_CHANGE_PCT` | 1 | 利率變動 < 1% 不動(避免抖動造成的小幅頻繁改單) |
+| `STRATEGY_DAILY_BUDGET` | 200 | 每幣別每 24h 最多 200 次寫入(超過 hard stop) |
+| `STRATEGY_DEBOUNCE_MS` | 1500 | WS 事件爆量時的 debounce 視窗 |
+
+任一 guard 阻擋時:
+- log 印 `engine skip: <reason>`
+- 推 `strategy.skipped` 事件(5 分鐘 cooldown)
+- SSE 推給 dashboard
+
+### 退役舊 cron
+- daemon (live) + cron 同時跑會**搶下單**(兩者都會 cancelAll + applyAutoFunding)
+- 切到 live 之後必須 disable workflow:`.github/workflows/wtkuo-auto-renew-3.yml`
+- 緊急 fallback:把 STRATEGY_MODE 改回 `off`,re-enable workflow,bot 變回 cron 模式
+
+### 保留不動的部分
+- **`bin/funding-statistics-1.ts` + GitHub Pages**:歷史圖表來源,daemon 不重複做
+- **Telegram secrets**:已改成沒設定就 no-op,移除/留著都可以
+- **`bin/funding-auto-renew-3.ts` 檔案**:不刪除,作為 daemon 死掉時的緊急 fallback
 
 ---
 

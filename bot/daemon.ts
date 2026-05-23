@@ -11,7 +11,7 @@ Bitfinex Lending Bot - 即時監控 daemon
 import 'dotenv/config'
 import { Bitfinex } from '@taichunmin/bitfinex'
 
-import { loadConfig } from './config.js'
+import { loadConfig, type StrategyMode } from './config.js'
 import { StateStore, type CurrencyState } from './state.js'
 import { PublicSubscriber } from './ws/publicSubscriber.js'
 import { AuthSubscriber } from './ws/authSubscriber.js'
@@ -19,6 +19,10 @@ import { SubscriptionStore } from './store/subscriptions.js'
 import { PushNotifier } from './notify/push.js'
 import { EventDispatcher, type NotifyEvent } from './notify/events.js'
 import { createServer } from './api/server.js'
+import { CandleBuffer } from './strategy/candleBuffer.js'
+import { SafetyGuards } from './strategy/safetyGuards.js'
+import { ReactiveEngine, type EngineEvent } from './strategy/reactiveEngine.js'
+import { RestExecutor } from './rest/executor.js'
 import { createLoggersByUrl } from '../lib/logger.mjs'
 
 const loggers = createLoggersByUrl(import.meta.url)
@@ -26,8 +30,15 @@ const log = (loggers as any).info as (msg: any) => void
 const logErr = (loggers as any).error as (msg: any) => void
 
 async function main (): Promise<void> {
-  const cfg = loadConfig()
-  log({ msg: 'config loaded', currencies: cfg.currencies, port: cfg.apiPort })
+  const cfg = await loadConfig()
+  log({
+    msg: 'config loaded',
+    currencies: cfg.currencies,
+    port: cfg.apiPort,
+    strategyMode: cfg.strategyMode,
+    strategyConfigSource: cfg.strategyConfigSource,
+    strategyCurrencies: Object.keys(cfg.strategyConfig),
+  })
 
   const state = new StateStore(cfg.currencies)
   const subs = new SubscriptionStore(cfg.dataDir)
@@ -166,6 +177,71 @@ async function main (): Promise<void> {
 
   auth.connect()
 
+  // ─── Reactive trading engine (optional, off by default) ───────────
+  const strategyCurrencies = Object.keys(cfg.strategyConfig)
+  let engine: ReactiveEngine | null = null
+  let candleBuf: CandleBuffer | null = null
+  let candleTimer: NodeJS.Timeout | null = null
+  let statusTimer: NodeJS.Timeout | null = null
+
+  if (cfg.strategyMode !== 'off' && strategyCurrencies.length > 0) {
+    candleBuf = new CandleBuffer(strategyCurrencies)
+    const guards = new SafetyGuards({
+      warmupMs: cfg.strategy.warmupMs,
+      minIntervalMs: cfg.strategy.minIntervalMs,
+      minRateChangePct: cfg.strategy.minRateChangePct,
+      dailyBudget: cfg.strategy.dailyBudget,
+      minAmountToTrade: cfg.strategy.minAmountToTrade,
+    })
+    const executor = new RestExecutor(bitfinex as any)
+
+    engine = new ReactiveEngine({
+      mode: cfg.strategyMode,
+      config: cfg.strategyConfig,
+      state,
+      candles: candleBuf,
+      guards,
+      executor,
+      debounceMs: cfg.strategy.debounceMs,
+      log,
+      logErr,
+      onEvent: (e: EngineEvent) => handleEngineEvent(e, dispatcher),
+    })
+
+    log({ msg: 'strategy engine initialized', mode: cfg.strategyMode, currencies: strategyCurrencies })
+
+    // initial warmup: load candles + current auto-renew status
+    void candleBuf.refreshAll().then(() => log({ msg: 'candle buffer warmed' }))
+    void Promise.all(strategyCurrencies.map(c => engine!.refreshCurrent(c)))
+      .then(() => log({ msg: 'auto-renew status warmed' }))
+
+    candleTimer = candleBuf.startAutoRefresh(cfg.strategy.candleRefreshMs)
+    statusTimer = setInterval(() => {
+      for (const cur of strategyCurrencies) void engine!.refreshCurrent(cur)
+    }, cfg.strategy.statusRefreshMs)
+
+    // wire WS triggers
+    pub.on('trade', (t) => {
+      if (strategyCurrencies.includes(t.currency)) engine!.trigger(t.currency)
+    })
+    pub.on('ticker', (t) => {
+      if (strategyCurrencies.includes(t.currency)) engine!.trigger(t.currency)
+    })
+    auth.on('credit', (c) => {
+      if (strategyCurrencies.includes(c.currency)) engine!.trigger(c.currency)
+    })
+    auth.on('offer', (o) => {
+      if (strategyCurrencies.includes(o.currency)) engine!.trigger(o.currency)
+    })
+    auth.on('wallet', (w) => {
+      if (w.type === 'funding' && strategyCurrencies.includes(w.currency)) {
+        engine!.trigger(w.currency)
+      }
+    })
+  } else {
+    log({ msg: 'strategy engine OFF (set STRATEGY_MODE=dry_run|live to enable)' })
+  }
+
   // ─── Health monitor ───────────────────────────────────────────────
   let lastHealthy = true
   const lastEventAt = { v: Date.now() }
@@ -205,7 +281,12 @@ async function main (): Promise<void> {
     vapidPublicKey: cfg.vapidPublicKey,
     viewerToken: cfg.viewerToken,
     publicOrigin: cfg.publicOrigin,
-    health: () => ({ wsPublic: pub.isHealthy(), wsAuth: auth.isHealthy(), lastEventAt: lastEventAt.v }),
+    health: () => ({
+      wsPublic: pub.isHealthy(),
+      wsAuth: auth.isHealthy(),
+      lastEventAt: lastEventAt.v,
+      strategyMode: cfg.strategyMode,
+    }),
     onStateChange: (cb) => state.subscribe(cb),
     onNotifyEvent: (cb) => dispatcher.subscribe(cb),
   })
@@ -217,11 +298,47 @@ async function main (): Promise<void> {
     log('shutting down')
     pub.close()
     auth.close()
+    if (candleTimer) clearInterval(candleTimer)
+    if (statusTimer) clearInterval(statusTimer)
     server.close()
     setTimeout(() => process.exit(0), 1000)
   }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
+}
+
+function handleEngineEvent (e: EngineEvent, dispatcher: EventDispatcher): void {
+  if (!e.decision) return
+  const fmtRate = (r: number) => `${(r * 100).toFixed(4)}%`
+  const rateStr = fmtRate(e.decision.clampedRate)
+  const period = e.decision.period
+  if (e.kind === 'executed' && e.mode === 'dry_run') {
+    void dispatcher.dispatch({
+      kind: 'strategy.dry_run',
+      currency: e.currency,
+      title: `[DRY-RUN] ${e.currency} 預計改設定`,
+      body: `→ ${rateStr}/d × ${period}d (p${(e.decision.effectiveRank * 100).toFixed(0)})`,
+      data: { decision: e.decision, current: e.current },
+    })
+  } else if (e.kind === 'executed' && e.mode === 'live') {
+    void dispatcher.dispatch({
+      kind: 'strategy.executed',
+      currency: e.currency,
+      title: `${e.currency} 自動掛單已更新`,
+      body: `${rateStr}/d × ${period}d`,
+      data: { decision: e.decision, current: e.current },
+    })
+  } else if (e.kind === 'error') {
+    void dispatcher.dispatch({
+      kind: 'strategy.error',
+      currency: e.currency,
+      title: `${e.currency} 策略執行錯誤`,
+      body: e.error ?? 'unknown',
+      data: { decision: e.decision, current: e.current, error: e.error },
+    })
+  }
+  // 'decision' and 'skipped' are intentionally NOT pushed by default
+  // (too noisy); they flow through SSE for the dashboard.
 }
 
 async function loadInitialSnapshot (bitfinex: any, state: StateStore, currency: string): Promise<void> {

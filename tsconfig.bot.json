@@ -11,8 +11,9 @@
     "noImplicitAny": false,
     "noEmit": true,
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "lib": ["ES2022"],
     "types": ["node"]
   },
-  "include": ["bot/**/*.ts"]
+  "include": ["bot/**/*.ts", "bin/funding-auto-renew-3.ts", "lib/**/*.mjs"]
 }

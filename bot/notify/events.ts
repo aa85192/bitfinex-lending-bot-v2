@@ -9,6 +9,10 @@ export type EventKind =
   | 'market.rate_spike'
   | 'bot.unhealthy'
   | 'bot.recovered'
+  | 'strategy.dry_run'
+  | 'strategy.executed'
+  | 'strategy.skipped'
+  | 'strategy.error'
 
 export interface NotifyEvent {
   kind: EventKind
@@ -39,6 +43,10 @@ export class EventDispatcher {
       'market.rate_spike': 60_000,
       'bot.unhealthy': 5 * 60_000,
       'bot.recovered': 0,
+      'strategy.dry_run': 60_000,
+      'strategy.executed': 0,
+      'strategy.skipped': 5 * 60_000,
+      'strategy.error': 60_000,
     },
   ) {}
 

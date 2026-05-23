@@ -14,7 +14,7 @@ interface ServerDeps {
   vapidPublicKey: string
   viewerToken: string
   publicOrigin: string
-  health: () => { wsPublic: boolean, wsAuth: boolean, lastEventAt: number }
+  health: () => { wsPublic: boolean, wsAuth: boolean, lastEventAt: number, strategyMode?: string }
   onNotifyEvent: (cb: (e: NotifyEvent) => void) => () => void
   onStateChange: (cb: (currency: string, state: CurrencyState) => void) => () => void
 }
