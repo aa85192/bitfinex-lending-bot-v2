@@ -10,6 +10,12 @@ yarn tsx ./bin/funding-auto-renew-3.ts
 時間權重：同一個 30 分鐘 bucket 內的蠟燭共享相同權重，線性從 1.0（最新）衰減至 0.5（24h 前）。
 不使用 FRR：自我強化迴圈使 FRR 系統性偏高。
 不使用 Funding Book：book 上只有未成交的掛單（利率太低沒人借的），不反映真實成交行情。
+
+rankSplit 模式（手動拆單）：
+- 當 rankSplit 陣列有設定時，改用手動掛單替代自動出借
+- 每個 entry 指定固定金額（amount）和利率百分位（rank）
+- 程式會分別計算各筆利率並逐筆送出 Funding Offer
+- 例：rankSplit: [{amount: 500, rank: 0.6}, {amount: 500, rank: 0.85}]
 */
 
 // import first before other imports
@@ -17,9 +23,16 @@ import { getenv } from '../lib/dotenv.mjs'
 
 import { Bitfinex, BitfinexSort, PlatformStatus } from '@taichunmin/bitfinex'
 import _ from 'lodash'
+import { createRequire } from 'node:module'
 import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
+
+const require = createRequire(import.meta.url)
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { FundingOffer } = require('bfx-api-node-models') as { FundingOffer: any }
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { RESTv2 } = require('bitfinex-api-node') as { RESTv2: new (opts: Record<string, any>) => any }
 import { dayjs } from '../lib/dayjs.mjs'
 import { floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
@@ -45,6 +58,14 @@ const bitfinex = new Bitfinex({
   apiSecret: getenv('BITFINEX_API_SECRET'),
   affCode: getenv('BITFINEX_AFF_CODE'),
 })
+
+// 用於手動送出 Funding Offer（@taichunmin/bitfinex 不支援此功能）
+const bfxRest = new RESTv2(_.omitBy({
+  apiKey: getenv('BITFINEX_API_KEY'),
+  apiSecret: getenv('BITFINEX_API_SECRET'),
+  transform: true,
+  affCode: getenv('BITFINEX_AFF_CODE'),
+}, _.isNil))
 
 function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
@@ -147,7 +168,7 @@ const ZodConfigCurrency = z.object({
   amount: z.coerce.number().min(0).default(0),
   rank: z.coerce.number().min(0).max(1).default(0.8),
   rankSplit: z.array(z.object({
-    ratio: z.coerce.number().min(0).max(1),
+    amount: z.coerce.number().positive(), // 每筆固定金額（取代 ratio）
     rank: z.coerce.number().min(0).max(1),
   })).default([]),
   rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
@@ -171,12 +192,9 @@ const ZodDb = z.object({
 
 class SkipError extends Error {}
 
+// rankSplit 模式改為手動拆單，effectiveRank 只在 auto-renew 模式使用
 function resolveEffectiveRank (cfg1: z.output<typeof ZodConfigCurrency>): number {
-  if (cfg1.rankSplit.length === 0) return cfg1.rank
-  const ratioSum = _.sumBy(cfg1.rankSplit, 'ratio')
-  if (ratioSum <= 0) return cfg1.rank
-  const normalized = cfg1.rankSplit.map(item => ({ ...item, ratio: item.ratio / ratioSum }))
-  return _.sumBy(normalized, item => item.rank * item.ratio)
+  return cfg1.rank
 }
 
 export async function main (): Promise<void> {
@@ -374,39 +392,113 @@ export async function main (): Promise<void> {
 
         const FRR_APR_THRESHOLD = 0.14 / 365 // 14% APR 換算成日利率
         const frrHighRate = frr > FRR_APR_THRESHOLD
-        const finalRate = frrHighRate ? frr : _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)
-        const finalPeriod = frrHighRate ? 120 : rateToPeriod(cfg1.period, _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax))
         if (frrHighRate) loggers.log(`[${currency}] FRR (${rateStringify(frr)}) > 14% APR，使用 FRR 利率並設定 120 天`)
 
-        const newAutoRenew = trace.newAutoRenew = {
-          amount: cfg1.amount,
-          currency,
-          period: finalPeriod,
-          rate: finalRate,
-        }
-        ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate), frrHighRate })
-
         const walletAvailable = (wallets[`funding:${currency}`] as any)?.availableBalance ?? 0
-        const settingsChanged = !_.isMatch(prevAutoRenew ?? {}, newAutoRenew)
 
-        if (!settingsChanged && walletAvailable < 1) {
-          trace.autoRenewChanged = false
-          loggers.log('Setting of auto-renew no change.')
-        } else {
-          trace.autoRenewChanged = true
-          if (settingsChanged) {
-            if (!_.isNil(prevAutoRenew)) await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
-            await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
-          } else {
-            // 設定未變，但有閒置資金（如到期歸還），直接觸發自動掛單讓 Bitfinex 重新建立掛單
-            loggers.log(`Available balance ${floatFormatDecimal(walletAvailable, 2)}, re-triggering auto-funding`)
+        if (cfg1.rankSplit.length > 0) {
+          // ====== 手動拆單模式（rankSplit 有設定時啟用）======
+
+          // 1. 為每筆 rankSplit 計算各自的利率
+          const splitTargets = cfg1.rankSplit.map(split => {
+            const splitRankBI = BigInt(_.round(split.rank * 1e8))
+            const splitRateBI = binarySearchRateBI(weightedRanges, totalWeightedVol, splitRankBI)
+            const splitRate = Number(splitRateBI) / 1e8
+            const finalRate = frrHighRate ? frr : _.clamp(splitRate, cfg1.rateMin, cfg1.rateMax)
+            const finalPeriod = frrHighRate ? 120 : rateToPeriod(cfg1.period, _.clamp(splitRate, cfg1.rateMin, cfg1.rateMax))
+            return { amount: split.amount, rate: finalRate, period: finalPeriod, rank: split.rank }
+          })
+
+          ymlDump('splitTargets', splitTargets.map(t => ({
+            amount: t.amount,
+            rank: t.rank,
+            rate: t.rate,
+            rateStr: rateStringify(t.rate),
+            period: t.period,
+          })))
+
+          // 2. 關閉自動出借（若已啟用）
+          if (!_.isNil(prevAutoRenew)) {
+            loggers.log(`[${currency}] 關閉自動出借，改用手動拆單模式`)
+            await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
           }
-          await bitfinex.v2AuthWriteFundingAuto({
-            ...newAutoRenew,
-            rate: floatFloor8(newAutoRenew.rate * 100), // API 要的是百分比
-            status: 1,
-          }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
-          await scheduler.wait(1000)
+
+          // 3. 取得目前掛單，比對是否需要重新送單
+          const existingOffers = await bitfinex.v2AuthReadFundingOffers({ currency })
+          const desiredRates = _.sortBy(splitTargets.map(t => floatFloor8(t.rate)))
+          const existingRates = _.sortBy(existingOffers.map((o: any) => floatFloor8(o.rate)))
+          const offersMatch = existingOffers.length === splitTargets.length
+            && _.isEqual(desiredRates, existingRates)
+
+          if (offersMatch && walletAvailable < 50) {
+            trace.autoRenewChanged = false
+            loggers.log(`[${currency}] 拆單掛單無變化，略過`)
+          } else {
+            trace.autoRenewChanged = true
+            // 取消所有未成交掛單，再重新送單
+            await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
+            await scheduler.wait(500)
+
+            for (const target of splitTargets) {
+              loggers.log(`[${currency}] 送出掛單 ${target.amount} @ ${rateStringify(target.rate)} x ${target.period}天`)
+              const offer = new FundingOffer({
+                type: 'LIMIT',
+                symbol: `f${currency}`,
+                amount: target.amount,
+                // submitFundingOffer 的 rate 格式為每日小數利率（與 v2AuthReadFundingOffers 回傳相同）
+                rate: target.rate,
+                period: target.period,
+              })
+              await bfxRest.submitFundingOffer({ offer })
+                .catch((err: any) => { throw _.set(err, 'data.target', target) })
+              await scheduler.wait(500) // 避免 nonce 衝突
+            }
+          }
+
+          // 供 Telegram 通知使用
+          trace.newAutoRenew = {
+            currency,
+            amount: _.sumBy(splitTargets, 'amount'),
+            rate: splitTargets[0]?.rate ?? 0,
+            period: splitTargets[0]?.period ?? 2,
+          }
+          trace.splitTargets = splitTargets
+
+        } else {
+          // ====== 自動出借模式（原有邏輯）======
+
+          const finalRate = frrHighRate ? frr : _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)
+          const finalPeriod = frrHighRate ? 120 : rateToPeriod(cfg1.period, _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax))
+
+          const newAutoRenew = trace.newAutoRenew = {
+            amount: cfg1.amount,
+            currency,
+            period: finalPeriod,
+            rate: finalRate,
+          }
+          ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate), frrHighRate })
+
+          const settingsChanged = !_.isMatch(prevAutoRenew ?? {}, newAutoRenew)
+
+          if (!settingsChanged && walletAvailable < 1) {
+            trace.autoRenewChanged = false
+            loggers.log('Setting of auto-renew no change.')
+          } else {
+            trace.autoRenewChanged = true
+            if (settingsChanged) {
+              if (!_.isNil(prevAutoRenew)) await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
+              await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
+            } else {
+              // 設定未變，但有閒置資金（如到期歸還），直接觸發自動掛單讓 Bitfinex 重新建立掛單
+              loggers.log(`Available balance ${floatFormatDecimal(walletAvailable, 2)}, re-triggering auto-funding`)
+            }
+            await bitfinex.v2AuthWriteFundingAuto({
+              ...newAutoRenew,
+              rate: floatFloor8(newAutoRenew.rate * 100), // API 要的是百分比
+              status: 1,
+            }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
+            await scheduler.wait(1000)
+          }
         }
       } catch (err) {
         if (!(err instanceof SkipError)) throw err
@@ -444,16 +536,17 @@ export async function main (): Promise<void> {
         }))
 
         const nowts = dayjs().utcOffset(8)
+        const splitTargets: Array<{ amount: number, rate: number, period: number, rank: number }> | undefined = trace.splitTargets
+        const orderSettingText = splitTargets != null && splitTargets.length > 0
+          ? `手動拆單設定:\n${splitTargets.map((t, i) => `    #${i + 1}: ${floatFormatDecimal(t.amount, 0)} @ ${floatFormatPercent(t.rate, 6)} APR:${floatFormatPercent(t.rate * 365)} x ${t.period}天`).join('\n')}`
+          : `自動掛單設定:\n    利率: ${floatFormatPercent(autoRenew.rate, 6)}\n    APR: ${floatFormatPercent(autoRenew.rate * 365)}\n    天數: ${autoRenew.period}`
         const msgText = [
           telegram.tgMdEscape(`# ${filename}: ${currency} 狀態
 
 投資額: ${floatFormatDecimal(totalAmount, 3)}
 已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${progressPercent(creditsAmountSum, totalAmount)})
 掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, totalAmount)})
-自動掛單設定:
-    利率: ${floatFormatPercent(autoRenew.rate, 6)}
-    APR: ${floatFormatPercent(autoRenew.rate * 365)}
-    天數: ${autoRenew.period}
+${orderSettingText}
 收益率:
     借出APR: ${floatFormatPercent(borrowedApr)}
     綜合APR: ${floatFormatPercent(portfolioApr)}`),
