@@ -124,3 +124,9 @@ jobs:
           yarn > /dev/null 2>&1
           yarn lint
           yarn tsx ./bin/funding-auto-renew-3.ts
+      - name: Trigger status update (gh-pages)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run gh-pages.yml --repo ${{ github.repository }} --ref master

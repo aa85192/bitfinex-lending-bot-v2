@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 const REPO = 'aa85192/bitfinex-lending-bot-v2'
 const TOKEN_KEY = 'github_pat'
 
-type Status = 'idle' | 'step1' | 'step2' | 'success' | 'error'
+type Status = 'idle' | 'running' | 'success' | 'error'
 
 async function dispatchWorkflow (workflowId: string, token: string): Promise<void> {
   const res = await fetch(
@@ -49,13 +49,11 @@ export default function GithubActionsPanel () {
   }
 
   const run = async () => {
-    if (!token || status === 'step1' || status === 'step2') return
+    if (!token || status === 'running') return
     clearTimeout(resetTimer.current)
     try {
-      setStatus('step1')
+      setStatus('running')
       await dispatchWorkflow('wtkuo-auto-renew-3.yml', token)
-      setStatus('step2')
-      await dispatchWorkflow('gh-pages.yml', token)
       setStatus('success')
     } catch {
       setStatus('error')
@@ -63,12 +61,11 @@ export default function GithubActionsPanel () {
     resetTimer.current = setTimeout(() => setStatus('idle'), 6000)
   }
 
-  const isLoading = status === 'step1' || status === 'step2'
+  const isLoading = status === 'running'
   const disabled = !token || isLoading
 
   const stepLabel =
-    status === 'step1' ? '自動掛單…' :
-    status === 'step2' ? '狀態更新…' :
+    status === 'running' ? '觸發中…' :
     status === 'success' ? '已觸發' :
     status === 'error' ? '失敗' :
     '執行'
@@ -159,14 +156,8 @@ export default function GithubActionsPanel () {
         {stepLabel}
       </button>
 
-      {/* 步驟進度提示 */}
-      {isLoading && (
-        <span className="text-xs text-gray-400">
-          {status === 'step1' ? '1/2 觸發中…' : '2/2 觸發中…'}
-        </span>
-      )}
       {status === 'success' && (
-        <span className="text-xs text-gray-400">等待 1~2 分鐘後按重整</span>
+        <span className="text-xs text-gray-400">等待 2~3 分鐘後按重整</span>
       )}
     </div>
   )
