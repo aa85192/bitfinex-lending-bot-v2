@@ -220,6 +220,14 @@ export async function main (): Promise<void> {
           })
         }
 
+        const fundingStats = (await Bitfinex.v2FundingStatsHist({ currency, limit: 1 }))?.[0]
+        const frr = fundingStats?.frr ?? 0
+        ymlDump('fundingStats', {
+          currency,
+          frr: rateStringify(frr),
+          frrApr: floatFormatPercent(frr * 365),
+        })
+
         // 明確鎖定最近 24 小時視窗，避免 `limit: 1440` 跨越超過 24h
         const now = Date.now()
         const windowStart = new Date(now - WINDOW_MS)
@@ -364,13 +372,19 @@ export async function main (): Promise<void> {
           targetRateStr: rateStringify(targetRate),
         })
 
+        const FRR_APR_THRESHOLD = 0.14 / 365 // 14% APR 換算成日利率
+        const frrHighRate = frr > FRR_APR_THRESHOLD
+        const finalRate = frrHighRate ? frr : _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)
+        const finalPeriod = frrHighRate ? 120 : rateToPeriod(cfg1.period, _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax))
+        if (frrHighRate) loggers.log(`[${currency}] FRR (${rateStringify(frr)}) > 14% APR，使用 FRR 利率並設定 120 天`)
+
         const newAutoRenew = trace.newAutoRenew = {
           amount: cfg1.amount,
           currency,
-          period: rateToPeriod(cfg1.period, _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)),
-          rate: _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax),
+          period: finalPeriod,
+          rate: finalRate,
         }
-        ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate) })
+        ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate), frrHighRate })
 
         const walletAvailable = (wallets[`funding:${currency}`] as any)?.availableBalance ?? 0
         const settingsChanged = !_.isMatch(prevAutoRenew ?? {}, newAutoRenew)

@@ -194,12 +194,18 @@ export async function main (): Promise<void> {
   }
 
   // target
-  const targetRate = _.clamp(Number(ctxBs.targetRate) / 1e8, cfg.rateMin, cfg.rateMax)
+  const FRR_APR_THRESHOLD = 0.14 / 365 // 14% APR 換算成日利率
+  const frr = fundingStats.frr
+  const frrHighRate = frr > FRR_APR_THRESHOLD
+  const targetRate = frrHighRate
+    ? frr // FRR > 14% APR：直接用 FRR 利率
+    : _.clamp(Number(ctxBs.targetRate) / 1e8, cfg.rateMin, cfg.rateMax)
   const target = {
     rate: targetRate,
-    period: rateToPeriod(cfg.period, targetRate),
+    period: frrHighRate ? 120 : rateToPeriod(cfg.period, targetRate), // FRR > 14% APR：固定 120 天
   }
-  ymlDump('target', { ...target, rate: rateStringify(target.rate) })
+  if (frrHighRate) loggers.log(`FRR (${rateStringify(frr)}) > 14% APR，使用 FRR 利率並設定 120 天`)
+  ymlDump('target', { ...target, rate: rateStringify(target.rate), frrHighRate })
 
   if (_.isMatchWith(autoRenew ?? {}, target, floatIsEqual)) {
     loggers.log('Setting of auto-renew no change.')
