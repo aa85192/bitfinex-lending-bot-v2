@@ -372,11 +372,11 @@ export async function main (): Promise<void> {
           targetRateStr: rateStringify(targetRate),
         })
 
-        const FRR_APR_THRESHOLD = 0.14 / 365 // 14% APR 換算成日利率
-        const frrHighRate = frr > FRR_APR_THRESHOLD
+        const FRR_APR_THRESHOLD = 0.1395 / 365 // 13.95% APR 換算成日利率
+        const frrHighRate = frr >= FRR_APR_THRESHOLD
         const finalRate = frrHighRate ? frr : _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)
         const finalPeriod = frrHighRate ? 120 : rateToPeriod(cfg1.period, _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax))
-        if (frrHighRate) loggers.log(`[${currency}] FRR (${rateStringify(frr)}) > 14% APR，使用 FRR 利率並設定 120 天`)
+        if (frrHighRate) loggers.log(`[${currency}] FRR (${rateStringify(frr)}) >= 13.95% APR，使用 FRR 利率並設定 120 天`)
 
         const newAutoRenew = trace.newAutoRenew = {
           amount: cfg1.amount,
