@@ -20,6 +20,7 @@ import _ from 'lodash'
 import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
+import { getFundingTicker } from '../lib/bitfinex.mjs'
 import { dayjs } from '../lib/dayjs.mjs'
 import { floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
@@ -220,12 +221,14 @@ export async function main (): Promise<void> {
           })
         }
 
-        const fundingStats = (await Bitfinex.v2FundingStatsHist({ currency, limit: 1 }))?.[0]
-        const frr = fundingStats?.frr ?? 0
-        ymlDump('fundingStats', {
+        // 即時 FRR 改用 funding ticker（與 Bitfinex 網頁顯示一致）；funding stats hist 是歷史快照會落後
+        const fundingTicker = await getFundingTicker({ currency })
+        const frr = fundingTicker?.frr ?? 0
+        ymlDump('fundingTicker', {
           currency,
           frr: rateStringify(frr),
           frrApr: floatFormatPercent(frr * 365),
+          frrAmountAvailable: floatFormatDecimal(fundingTicker?.frrAmountAvailable ?? 0, 2),
         })
 
         // 明確鎖定最近 24 小時視窗，避免 `limit: 1440` 跨越超過 24h
