@@ -398,10 +398,13 @@ export async function main (): Promise<void> {
         } else {
           trace.autoRenewChanged = true
           if (settingsChanged) {
+            // 利率/天期有變更：Bitfinex 自動掛單需先停用才能改利率，但「不」取消既有掛單。
+            // 停用本身不會取消掛單，既有掛單維持原利率自然成交或到期，避免拆單空窗把全錢包閒置；
+            // 重新啟用後 Bitfinex 會以新利率持續自動續借歸還與閒置資金。
             if (!_.isNil(prevAutoRenew)) await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
-            await bitfinex.v2AuthWriteFundingOfferCancelAll({ currency })
+            loggers.log(`Rate changed to ${rateStringify(newAutoRenew.rate)}, updating auto-funding (offers kept)`)
           } else {
-            // 設定未變，但有閒置資金（如到期歸還），直接觸發自動掛單讓 Bitfinex 重新建立掛單
+            // 設定未變，但有閒置資金（如到期歸還），直接重新觸發自動掛單讓 Bitfinex 掛出閒置資金
             loggers.log(`Available balance ${floatFormatDecimal(walletAvailable, 2)}, re-triggering auto-funding`)
           }
           await bitfinex.v2AuthWriteFundingAuto({
