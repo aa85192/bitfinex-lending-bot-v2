@@ -9,6 +9,7 @@ INPUT_CURRENCYS=USD,UST yarn tsx ./bin/export-current-status.ts
 import { getenv } from '../lib/dotenv.mjs'
 
 import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
+import { rest } from '../lib/bitfinex.mjs'
 import { promises as fsPromises } from 'node:fs'
 import { gzip } from 'node:zlib'
 import { promisify } from 'node:util'
@@ -63,7 +64,10 @@ async function main (): Promise<void> {
   for (const currency of currencys) {
     try {
       // 循序呼叫避免 nonce 衝突
+      // Bitfinex 把已媒合的出借拆成 credits（使用中）與 loans（已媒合未使用），兩者皆為實際出借中
+      // 並計息，需合併才不會少算。@taichunmin client 未提供 loans，改用 RESTv2（rest）讀取。
       const credits = await withNonceRetry(() => bitfinex.v2AuthReadFundingCredits({ currency }))
+      const loans = await withNonceRetry(() => rest.fundingLoans({ symbol: `f${currency}` })).catch(() => [])
       const offers = await withNonceRetry(() => bitfinex.v2AuthReadFundingOffers({ currency }))
       const autoRenew = await withNonceRetry(() => bitfinex.v2AuthReadFundingAutoStatus({ currency })).catch(() => null)
 
@@ -71,21 +75,23 @@ async function main (): Promise<void> {
         (w: any) => w.type === 'funding' && w.currency === currency
       )
 
-      const creditsData = (credits as any[])
-        .filter((c: any) => c.side === 1)
-        .map((c: any) => ({
-          id: c.id,
-          amount: Math.abs(c.amount),
-          rate: c.rate,
-          period: c.period,
-          mtsOpening: (c.mtsOpening instanceof Date ? c.mtsOpening : new Date(c.mtsOpening)).toISOString(),
-          mtsLastPayout: (() => {
-            const ms = c.mtsLastPayout instanceof Date
-              ? c.mtsLastPayout.getTime()
-              : Number(c.mtsLastPayout)
-            return ms > 0 ? new Date(ms).toISOString() : null
-          })(),
-        }))
+      const toIso = (v: any): string | null => {
+        const ms = v instanceof Date ? v.getTime() : Number(v)
+        return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null
+      }
+      // credits 與 loans 欄位一致（id/side/amount/rate/period/mtsOpening/mtsLastPayout），共用對應
+      const mapLending = (x: any) => ({
+        id: x.id,
+        amount: Math.abs(x.amount),
+        rate: x.rate,
+        period: x.period,
+        mtsOpening: toIso(x.mtsOpening ?? x.mtsCreate) ?? new Date().toISOString(),
+        mtsLastPayout: toIso(x.mtsLastPayout),
+      })
+      const creditsList = (credits as any[]).filter((c: any) => c.side === 1)
+      const loansList = (loans as any[]).filter((l: any) => l.side === 1)
+      // 出借明細 = 使用中（credits）+ 已媒合未使用（loans），合併呈現完整出借部位
+      const creditsData = [...creditsList, ...loansList].map(mapLending)
       const offersData = (offers as any[]).map((o: any) => ({
         id: o.id,
         amount: Math.abs(o.amount),
@@ -93,16 +99,13 @@ async function main (): Promise<void> {
         period: o.period,
       }))
 
-      // wallet.balance（Bitfinex 總餘額）在入金後會與「可用 + 已借出 + 掛單」短暫失真，
-      // 與 funding-auto-renew-3 一致：改用 availableBalance + 已部署金額作為投資總額，
-      // 並輸出真實 availableBalance，確保 webapp 顯示的可用餘額等於 Bitfinex 真正可掛單的金額。
+      // 投資總額用 Bitfinex 真實總餘額（wallet.balance），可用餘額用真實 availableBalance，
+      // 兩者皆直接取自錢包，避免回推失真；已借出 = credits + loans 已可對齊總餘額。
       const availableBalance = (fundingWallet as any)?.availableBalance ?? 0
-      const creditsSum = creditsData.reduce((s, c) => s + c.amount, 0)
-      const offersSum = offersData.reduce((s, o) => s + o.amount, 0)
 
       const data = {
         wallet: {
-          balance: availableBalance + creditsSum + offersSum,
+          balance: (fundingWallet as any)?.balance ?? 0,
           availableBalance,
         },
         credits: creditsData,
@@ -123,7 +126,7 @@ async function main (): Promise<void> {
         writeFile(new URL(`${currency}.json`, outdir), jsonStr),
         writeFileGz(new URL(`${currency}.json.gz`, outdir), jsonStr),
       ])
-      console.log(`[export-current-status] ✓ ${currency}: balance=${data.wallet.balance}, available=${data.wallet.availableBalance}, credits=${data.credits.length}, offers=${data.offers.length}`)
+      console.log(`[export-current-status] ✓ ${currency}: balance=${data.wallet.balance}, available=${data.wallet.availableBalance}, lending=${data.credits.length} (credits=${creditsList.length}+loans=${loansList.length}), offers=${data.offers.length}`)
     } catch (err) {
       console.error(`[export-current-status] ✗ ${currency} failed:`, err)
       hasError = true
