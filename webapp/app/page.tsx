@@ -13,7 +13,7 @@ const STATUS_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/current-s
 const HISTORY_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/funding-statistics-1'
 
 export interface StatusData {
-  wallet: { balance: number }
+  wallet: { balance: number; availableBalance?: number }
   credits: Array<{ id: number; amount: number; rate: number; period: number; mtsOpening: string; mtsLastPayout: string | null }>
   offers: Array<{ id: number; amount: number; rate: number; period: number }>
   autoRenew: { rate: number; period: number; amount: number } | null
@@ -87,7 +87,9 @@ export default function StatusPage () {
   const totalAmount = data?.wallet.balance ?? 0
   const creditsSum = data?.credits.reduce((s, c) => s + c.amount, 0) ?? 0
   const offersSum = data?.offers.reduce((s, o) => s + o.amount, 0) ?? 0
-  const availableBalance = Math.max(0, totalAmount - creditsSum - offersSum)
+  // 優先用 export 輸出的 Bitfinex 真實可用餘額（availableBalance），舊資料則回退為總額相減
+  const availableBalance = data?.wallet.availableBalance
+    ?? Math.max(0, totalAmount - creditsSum - offersSum)
 
   const updatedAt = data?.updatedAt
     ? new Date(data.updatedAt).toLocaleString('zh-Hant', {

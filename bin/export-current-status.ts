@@ -71,29 +71,42 @@ async function main (): Promise<void> {
         (w: any) => w.type === 'funding' && w.currency === currency
       )
 
+      const creditsData = (credits as any[])
+        .filter((c: any) => c.side === 1)
+        .map((c: any) => ({
+          id: c.id,
+          amount: Math.abs(c.amount),
+          rate: c.rate,
+          period: c.period,
+          mtsOpening: (c.mtsOpening instanceof Date ? c.mtsOpening : new Date(c.mtsOpening)).toISOString(),
+          mtsLastPayout: (() => {
+            const ms = c.mtsLastPayout instanceof Date
+              ? c.mtsLastPayout.getTime()
+              : Number(c.mtsLastPayout)
+            return ms > 0 ? new Date(ms).toISOString() : null
+          })(),
+        }))
+      const offersData = (offers as any[]).map((o: any) => ({
+        id: o.id,
+        amount: Math.abs(o.amount),
+        rate: o.rate,
+        period: o.period,
+      }))
+
+      // wallet.balance（Bitfinex 總餘額）在入金後會與「可用 + 已借出 + 掛單」短暫失真，
+      // 與 funding-auto-renew-3 一致：改用 availableBalance + 已部署金額作為投資總額，
+      // 並輸出真實 availableBalance，確保 webapp 顯示的可用餘額等於 Bitfinex 真正可掛單的金額。
+      const availableBalance = (fundingWallet as any)?.availableBalance ?? 0
+      const creditsSum = creditsData.reduce((s, c) => s + c.amount, 0)
+      const offersSum = offersData.reduce((s, o) => s + o.amount, 0)
+
       const data = {
-        wallet: { balance: fundingWallet?.balance ?? 0 },
-        credits: (credits as any[])
-          .filter((c: any) => c.side === 1)
-          .map((c: any) => ({
-            id: c.id,
-            amount: Math.abs(c.amount),
-            rate: c.rate,
-            period: c.period,
-            mtsOpening: (c.mtsOpening instanceof Date ? c.mtsOpening : new Date(c.mtsOpening)).toISOString(),
-            mtsLastPayout: (() => {
-              const ms = c.mtsLastPayout instanceof Date
-                ? c.mtsLastPayout.getTime()
-                : Number(c.mtsLastPayout)
-              return ms > 0 ? new Date(ms).toISOString() : null
-            })(),
-          })),
-        offers: (offers as any[]).map((o: any) => ({
-          id: o.id,
-          amount: Math.abs(o.amount),
-          rate: o.rate,
-          period: o.period,
-        })),
+        wallet: {
+          balance: availableBalance + creditsSum + offersSum,
+          availableBalance,
+        },
+        credits: creditsData,
+        offers: offersData,
         autoRenew: autoRenew != null
           ? {
               rate: (autoRenew as any).rate ?? 0,
@@ -110,7 +123,7 @@ async function main (): Promise<void> {
         writeFile(new URL(`${currency}.json`, outdir), jsonStr),
         writeFileGz(new URL(`${currency}.json.gz`, outdir), jsonStr),
       ])
-      console.log(`[export-current-status] ✓ ${currency}: balance=${data.wallet.balance}, credits=${data.credits.length}, offers=${data.offers.length}`)
+      console.log(`[export-current-status] ✓ ${currency}: balance=${data.wallet.balance}, available=${data.wallet.availableBalance}, credits=${data.credits.length}, offers=${data.offers.length}`)
     } catch (err) {
       console.error(`[export-current-status] ✗ ${currency} failed:`, err)
       hasError = true
