@@ -1,13 +1,15 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
 import CurrencyTabs from '@/components/CurrencyTabs'
 import MetricCard from '@/components/MetricCard'
+import SplitMetricCard from '@/components/SplitMetricCard'
 import AutoRenewCard from '@/components/AutoRenewCard'
 import CreditsTable from '@/components/CreditsTable'
 import LendingCharts from '@/components/LendingCharts'
 import GithubActionsPanel from '@/components/GithubActionsPanel'
 import type { HistoryRecord } from '@/components/HistoryTable'
+import { fmtInterest, monthKey } from '@/lib/format'
 
 const STATUS_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/current-status'
 const HISTORY_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/funding-statistics-1'
@@ -91,6 +93,20 @@ export default function StatusPage () {
   const availableBalance = data?.wallet.availableBalance
     ?? Math.max(0, totalAmount - creditsSum - offersSum)
 
+  // 上月／本月利息收入：以 history 每日利息依月份加總
+  const { lastMonth, thisMonth } = useMemo(() => {
+    const now = new Date()
+    const thisKey = monthKey(now.getFullYear(), now.getMonth())
+    const lastKey = monthKey(now.getFullYear(), now.getMonth() - 1)
+    const sumOf = (key: string) => history
+      .filter(r => r.date.startsWith(key))
+      .reduce((s, r) => s + r.interest, 0)
+    return {
+      lastMonth: { month: Number(lastKey.slice(5)), interest: sumOf(lastKey) },
+      thisMonth: { month: Number(thisKey.slice(5)), interest: sumOf(thisKey) },
+    }
+  }, [history])
+
   const updatedAt = data?.updatedAt
     ? new Date(data.updatedAt).toLocaleString('zh-Hant', {
         month: 'numeric', day: 'numeric',
@@ -136,7 +152,7 @@ export default function StatusPage () {
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {loading ? (
-          <><SkeletonCard /><SkeletonCard color="bg-emerald-50/60" /><SkeletonCard color="bg-sky-50/60" /></>
+          <><SkeletonCard /><SkeletonCard color="bg-emerald-50/60" /><SkeletonCard color="bg-violet-50/60" /></>
         ) : (
           <>
             <MetricCard
@@ -145,17 +161,43 @@ export default function StatusPage () {
               subtitle={`可用餘額 ${availableBalance.toFixed(2)} · ${currency}`}
               color="neutral"
             />
-            <MetricCard
-              label="已借出"
-              value={creditsSum.toFixed(2)}
-              subtitle={`${pct(creditsSum, totalAmount)} · ${currency}`}
+            <SplitMetricCard
+              label={`資金運用 · ${currency}`}
               color="emerald"
+              items={[
+                {
+                  label: '已借出',
+                  value: creditsSum.toFixed(2),
+                  subtitle: pct(creditsSum, totalAmount),
+                  color: 'emerald',
+                },
+                {
+                  label: '掛單中',
+                  value: offersSum.toFixed(2),
+                  subtitle: pct(offersSum, totalAmount),
+                  color: 'sky',
+                },
+              ]}
             />
-            <MetricCard
-              label="掛單中"
-              value={offersSum.toFixed(2)}
-              subtitle={`${pct(offersSum, totalAmount)} · ${currency}`}
-              color="sky"
+            <SplitMetricCard
+              label={`利息收入 · ${currency}`}
+              color="violet"
+              items={[
+                {
+                  label: '上月',
+                  value: fmtInterest(lastMonth.interest),
+                  subtitle: `${lastMonth.month} 月`,
+                  color: 'violet',
+                  loading: historyLoading,
+                },
+                {
+                  label: '本月',
+                  value: fmtInterest(thisMonth.interest),
+                  subtitle: `${thisMonth.month} 月`,
+                  color: 'amber',
+                  loading: historyLoading,
+                },
+              ]}
             />
           </>
         )}

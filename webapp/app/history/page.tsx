@@ -79,6 +79,11 @@ export default function HistoryPage() {
     return avg(valid.map(r => r.apr1))
   }, [filteredRecords])
 
+  // Total interest earned within the custom range
+  const periodInterest = useMemo(() => {
+    return filteredRecords.reduce((s, r) => s + r.interest, 0)
+  }, [filteredRecords])
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -106,6 +111,8 @@ export default function HistoryPage() {
         startDate={startDate}
         endDate={endDate}
         periodApy={loading ? null : periodApy}
+        periodInterest={loading ? null : periodInterest}
+        currency={currency}
         onStartChange={setStartDate}
         onEndChange={setEndDate}
       />

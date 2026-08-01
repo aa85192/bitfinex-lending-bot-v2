@@ -1,6 +1,6 @@
-type ColorScheme = 'neutral' | 'emerald' | 'sky' | 'teal' | 'violet' | 'amber'
+export type ColorScheme = 'neutral' | 'emerald' | 'sky' | 'teal' | 'violet' | 'amber'
 
-const colorMap: Record<ColorScheme, { bg: string; value: string; border: string }> = {
+export const colorMap: Record<ColorScheme, { bg: string; value: string; border: string }> = {
   neutral: { bg: 'bg-white', value: 'text-gray-900', border: 'border-gray-100' },
   emerald: { bg: 'bg-emerald-50/70', value: 'text-emerald-700', border: 'border-emerald-100' },
   sky:     { bg: 'bg-sky-50/70',     value: 'text-sky-700',     border: 'border-sky-100' },

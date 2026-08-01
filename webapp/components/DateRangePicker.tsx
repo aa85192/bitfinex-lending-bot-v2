@@ -1,9 +1,13 @@
 'use client'
 
+import { fmtInterest } from '@/lib/format'
+
 interface DateRangePickerProps {
   startDate: string
   endDate: string
   periodApy: number | null
+  periodInterest: number | null
+  currency: string
   onStartChange: (v: string) => void
   onEndChange: (v: string) => void
 }
@@ -12,6 +16,8 @@ export default function DateRangePicker({
   startDate,
   endDate,
   periodApy,
+  periodInterest,
+  currency,
   onStartChange,
   onEndChange,
 }: DateRangePickerProps) {
@@ -48,6 +54,17 @@ export default function DateRangePicker({
             <p className="text-xs text-emerald-600 mb-0.5">區間年化</p>
             <p className="text-2xl font-semibold tabular-nums text-emerald-700">
               {periodApy.toFixed(2)}%
+            </p>
+          </div>
+        )}
+
+        {/* Period total interest */}
+        {periodInterest !== null && (
+          <div className="bg-violet-50 rounded-xl px-5 py-2.5 border border-violet-100 flex-shrink-0">
+            <p className="text-xs text-violet-600 mb-0.5">區間利息總收入</p>
+            <p className="text-2xl font-semibold tabular-nums text-violet-700">
+              {fmtInterest(periodInterest)}
+              <span className="ml-1 text-sm font-normal text-violet-400">{currency}</span>
             </p>
           </div>
         )}
