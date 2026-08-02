@@ -10,6 +10,7 @@ import { getenv } from '../lib/dotenv.mjs'
 
 import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
 import { rest } from '../lib/bitfinex.mjs'
+import { fetchTwdRate } from '../lib/twd-rate.mjs'
 import { promises as fsPromises } from 'node:fs'
 import { gzip } from 'node:zlib'
 import { promisify } from 'node:util'
@@ -59,6 +60,12 @@ async function main (): Promise<void> {
   }
 
   const wallets = await withNonceRetry(() => bitfinex.v2AuthReadWallets())
+
+  // 台幣換算僅供顯示，抓不到就讓 twdRate 留 null，不影響放貸資料匯出
+  const twdRate = await fetchTwdRate()
+  console.log(twdRate != null
+    ? `[export-current-status] TWD rate=${twdRate.rate} (source=${twdRate.source})`
+    : '[export-current-status] TWD rate 取得失敗，本次略過台幣換算')
 
   let hasError = false
   for (const currency of currencys) {
@@ -117,6 +124,7 @@ async function main (): Promise<void> {
               amount: (autoRenew as any).amount ?? 0,
             }
           : null,
+        twdRate,
         updatedAt: new Date().toISOString(),
       }
 

@@ -4,6 +4,9 @@ export interface SplitMetricItem {
   label: string
   value: string
   subtitle?: string
+  /** 次要說明（例如台幣約當金額） */
+  note?: string
+  noteTitle?: string
   color?: ColorScheme
   loading?: boolean
 }
@@ -37,6 +40,11 @@ export default function SplitMetricCard ({ label, items, color = 'neutral' }: Sp
               )}
               {item.subtitle && (
                 <p className="text-xs text-gray-400 mt-0.5">{item.subtitle}</p>
+              )}
+              {item.note && !item.loading && (
+                <p className="text-xs text-gray-400 mt-0.5 tabular-nums" title={item.noteTitle}>
+                  {item.note}
+                </p>
               )}
             </div>
           )

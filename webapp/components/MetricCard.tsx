@@ -13,10 +13,13 @@ interface MetricCardProps {
   label: string
   value: string
   subtitle?: string
+  /** 次要說明（例如台幣約當金額），以更小的字顯示在 subtitle 之下 */
+  note?: string
+  noteTitle?: string
   color?: ColorScheme
 }
 
-export default function MetricCard ({ label, value, subtitle, color = 'neutral' }: MetricCardProps) {
+export default function MetricCard ({ label, value, subtitle, note, noteTitle, color = 'neutral' }: MetricCardProps) {
   const c = colorMap[color]
   return (
     <div className={`rounded-2xl shadow-sm border ${c.border} ${c.bg} p-6`}>
@@ -24,6 +27,9 @@ export default function MetricCard ({ label, value, subtitle, color = 'neutral' 
       <p className={`text-3xl font-semibold tabular-nums ${c.value}`}>{value}</p>
       {subtitle && (
         <p className="text-sm text-gray-400 mt-1">{subtitle}</p>
+      )}
+      {note && (
+        <p className="text-xs text-gray-400 mt-0.5 tabular-nums" title={noteTitle}>{note}</p>
       )}
     </div>
   )

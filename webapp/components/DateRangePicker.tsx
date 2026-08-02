@@ -48,26 +48,27 @@ export default function DateRangePicker({
           />
         </div>
 
-        {/* Period APY result */}
-        {periodApy !== null && (
-          <div className="sm:ml-4 bg-emerald-50 rounded-xl px-5 py-2.5 border border-emerald-100 flex-shrink-0">
-            <p className="text-xs text-emerald-600 mb-0.5">區間年化</p>
-            <p className="text-2xl font-semibold tabular-nums text-emerald-700">
-              {periodApy.toFixed(2)}%
-            </p>
-          </div>
-        )}
+        {/* 區間結果：利息總收入固定排在年化右邊，窄畫面也維持同一列 */}
+        <div className="flex items-stretch gap-3 sm:ml-4 flex-shrink-0 w-full sm:w-auto">
+          {periodApy !== null && (
+            <div className="bg-emerald-50 rounded-xl px-5 py-2.5 border border-emerald-100 flex-1 sm:flex-none">
+              <p className="text-xs text-emerald-600 mb-0.5">區間年化</p>
+              <p className="text-2xl font-semibold tabular-nums text-emerald-700">
+                {periodApy.toFixed(2)}%
+              </p>
+            </div>
+          )}
 
-        {/* Period total interest */}
-        {periodInterest !== null && (
-          <div className="bg-violet-50 rounded-xl px-5 py-2.5 border border-violet-100 flex-shrink-0">
-            <p className="text-xs text-violet-600 mb-0.5">區間利息總收入</p>
-            <p className="text-2xl font-semibold tabular-nums text-violet-700">
-              {fmtInterest(periodInterest)}
-              <span className="ml-1 text-sm font-normal text-violet-400">{currency}</span>
-            </p>
-          </div>
-        )}
+          {periodInterest !== null && (
+            <div className="bg-violet-50 rounded-xl px-5 py-2.5 border border-violet-100 flex-1 sm:flex-none">
+              <p className="text-xs text-violet-600 mb-0.5">區間利息總收入</p>
+              <p className="text-2xl font-semibold tabular-nums text-violet-700">
+                {fmtInterest(periodInterest)}
+                <span className="ml-1 text-sm font-normal text-violet-400">{currency}</span>
+              </p>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )

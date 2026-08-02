@@ -9,7 +9,7 @@ import CreditsTable from '@/components/CreditsTable'
 import LendingCharts from '@/components/LendingCharts'
 import GithubActionsPanel from '@/components/GithubActionsPanel'
 import type { HistoryRecord } from '@/components/HistoryTable'
-import { fmtInterest, monthKey } from '@/lib/format'
+import { fmtInterest, fmtTwd, monthKey } from '@/lib/format'
 
 const STATUS_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/current-status'
 const HISTORY_BASE = 'https://aa85192.github.io/bitfinex-lending-bot-v2/funding-statistics-1'
@@ -19,6 +19,8 @@ export interface StatusData {
   credits: Array<{ id: number; amount: number; rate: number; period: number; mtsOpening: string; mtsLastPayout: string | null }>
   offers: Array<{ id: number; amount: number; rate: number; period: number }>
   autoRenew: { rate: number; period: number; amount: number } | null
+  /** 美元兌台幣匯率，由匯出腳本抓取；來源不可用時為 null（舊資料則沒有此欄位） */
+  twdRate?: { rate: number; source: string; fetchedAt: string } | null
   updatedAt: string
 }
 
@@ -107,6 +109,14 @@ export default function StatusPage () {
     }
   }, [history])
 
+  // USD 與 UST 都是美元計價，共用同一組美元兌台幣匯率
+  const twdRate = data?.twdRate ?? null
+  const toTwd = (usd: number) => twdRate == null ? undefined : `≈ ${fmtTwd(usd * twdRate.rate)}`
+  const twdTitle = twdRate == null
+    ? undefined
+    : `${twdRate.source === 'bot' ? '臺灣銀行即期買入' : '參考匯率'} 1 ${currency} = ${twdRate.rate} TWD`
+      + `（${new Date(twdRate.fetchedAt).toLocaleString('zh-Hant')} 更新）`
+
   const updatedAt = data?.updatedAt
     ? new Date(data.updatedAt).toLocaleString('zh-Hant', {
         month: 'numeric', day: 'numeric',
@@ -159,6 +169,8 @@ export default function StatusPage () {
               label="投資總額"
               value={totalAmount.toFixed(2)}
               subtitle={`可用餘額 ${availableBalance.toFixed(2)} · ${currency}`}
+              note={toTwd(totalAmount)}
+              noteTitle={twdTitle}
               color="neutral"
             />
             <SplitMetricCard
@@ -187,6 +199,8 @@ export default function StatusPage () {
                   label: '上月',
                   value: fmtInterest(lastMonth.interest),
                   subtitle: `${lastMonth.month} 月`,
+                  note: toTwd(lastMonth.interest),
+                  noteTitle: twdTitle,
                   color: 'violet',
                   loading: historyLoading,
                 },
@@ -194,6 +208,8 @@ export default function StatusPage () {
                   label: '本月',
                   value: fmtInterest(thisMonth.interest),
                   subtitle: `${thisMonth.month} 月`,
+                  note: toTwd(thisMonth.interest),
+                  noteTitle: twdTitle,
                   color: 'amber',
                   loading: historyLoading,
                 },
