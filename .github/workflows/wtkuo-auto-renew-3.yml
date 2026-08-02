@@ -45,10 +45,10 @@ jobs:
       - name: Install dependencies, eslint, and run
         env:
           # https://docs.google.com/spreadsheets/d/1eJSlFDx5iFM_rMM9mFiPO16x1VhyDReAOeCyLT-bdRA/edit#gid=1058478097
+          # 保留金額（reserveAmount）改在 config/reserve-amount.json 設定，可透過 webapp 編輯，不寫在這裡
           INPUT_AUTO_RENEW_3: |
             USD:
               amount: 0
-              reserveAmount: 0 # 保留金額：歸還/閒置資金中，扣除此金額後才會繼續自動出借；0 代表不保留
               rank: 0.8
               rankSplit:
                 - ratio: 0.3
@@ -88,7 +88,6 @@ jobs:
                 30: 0.00082192
             UST:
               amount: 0
-              reserveAmount: 0 # 保留金額：歸還/閒置資金中，扣除此金額後才會繼續自動出借；0 代表不保留
               rank: 0.8
               rateMax: 0.001
               rateMin: 0.0001918

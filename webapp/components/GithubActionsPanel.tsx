@@ -1,15 +1,15 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import { GITHUB_REPO, GITHUB_TOKEN_KEY } from '@/lib/github'
 
-const REPO = 'aa85192/bitfinex-lending-bot-v2'
-const TOKEN_KEY = 'github_pat'
+const TOKEN_KEY = GITHUB_TOKEN_KEY
 
 type Status = 'idle' | 'step1' | 'step2' | 'success' | 'error'
 
 async function dispatchWorkflow (workflowId: string, token: string): Promise<void> {
   const res = await fetch(
-    `https://api.github.com/repos/${REPO}/actions/workflows/${workflowId}/dispatches`,
+    `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${workflowId}/dispatches`,
     {
       method: 'POST',
       headers: {

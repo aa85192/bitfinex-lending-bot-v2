@@ -17,6 +17,7 @@ import { getenv } from '../lib/dotenv.mjs'
 
 import { Bitfinex, BitfinexSort, PlatformStatus } from '@taichunmin/bitfinex'
 import _ from 'lodash'
+import { readFileSync } from 'node:fs'
 import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
@@ -160,6 +161,19 @@ const ZodConfigCurrency = z.object({
 
 const ZodConfig = z.record(z.string(), ZodConfigCurrency).default({})
 
+// 保留金額由 webapp（透過 GitHub Contents API）寫入 config/reserve-amount.json，
+// 與 workflow 的 INPUT_AUTO_RENEW_3 分開存放，避免網頁需要能改動 .github/workflows/*.yml 的權限。
+const ZodReserveAmountFile = z.record(z.string(), z.coerce.number().min(0)).catch({})
+
+function readReserveAmountFile (): Record<string, number> {
+  try {
+    const raw = readFileSync(new URL('../config/reserve-amount.json', import.meta.url), 'utf8')
+    return ZodReserveAmountFile.parse(JSON.parse(raw))
+  } catch {
+    return {}
+  }
+}
+
 const ZodDb = z.object({
   schema: z.literal(1),
   notified: z.record(
@@ -195,6 +209,12 @@ export async function main (): Promise<void> {
   })
 
   const cfg = ZodConfig.parse(parseYaml(getenv('INPUT_AUTO_RENEW_3', '')))
+
+  const reserveAmountFile = readReserveAmountFile()
+  ymlDump('reserveAmountFile', reserveAmountFile)
+  for (const [currency, cfg1] of _.entries(cfg)) {
+    if (currency in reserveAmountFile) cfg1.reserveAmount = reserveAmountFile[currency]
+  }
 
   const db = ZodDb.parse((await bitfinex.v2AuthReadSettings([DB_KEY]).catch(() => ({})))[DB_KEY.slice(4)])
   ymlDump('db', db)

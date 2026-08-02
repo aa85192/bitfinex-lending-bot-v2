@@ -5,6 +5,7 @@ import CurrencyTabs from '@/components/CurrencyTabs'
 import MetricCard from '@/components/MetricCard'
 import SplitMetricCard from '@/components/SplitMetricCard'
 import AutoRenewCard from '@/components/AutoRenewCard'
+import ReserveAmountCard from '@/components/ReserveAmountCard'
 import CreditsTable from '@/components/CreditsTable'
 import LendingCharts from '@/components/LendingCharts'
 import GithubActionsPanel from '@/components/GithubActionsPanel'
@@ -232,7 +233,10 @@ export default function StatusPage () {
               ))}
             </div>
           ) : (
-            <AutoRenewCard autoRenew={data?.autoRenew ?? null} currency={currency} updatedAt={data?.updatedAt} />
+            <div className="space-y-4">
+              <AutoRenewCard autoRenew={data?.autoRenew ?? null} currency={currency} updatedAt={data?.updatedAt} />
+              <ReserveAmountCard currency={currency} />
+            </div>
           )}
         </div>
         <div className="lg:col-span-3">
