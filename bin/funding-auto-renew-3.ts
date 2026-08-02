@@ -30,6 +30,7 @@ const loggers = createLoggersByUrl(import.meta.url)
 const filename = new URL(import.meta.url).pathname.replace(/^.*?([^/\\]+)\.[^.]+$/, '$1')
 const DB_KEY = `api:wtkuo_${filename}`
 const RATE_MIN = 0.0001 // APR 3.65%
+const RESERVE_MIN_LENDABLE = 50 // Bitfinex 自動借出最小金額（USD 或等值），低於此視為保留金額已全數保留
 const WINDOW_MS = 24 * 60 * 60 * 1000
 const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
 const BUCKET_MS = 30 * 60 * 1000 // 時間 bucket 大小：30 分鐘
@@ -146,6 +147,7 @@ const ZodConfigPeriod = z.record(
 
 const ZodConfigCurrency = z.object({
   amount: z.coerce.number().min(0).default(0),
+  reserveAmount: z.coerce.number().min(0).default(0),
   rank: z.coerce.number().min(0).max(1).default(0.8),
   rankSplit: z.array(z.object({
     ratio: z.coerce.number().min(0).max(1),
@@ -387,12 +389,52 @@ export async function main (): Promise<void> {
           period: finalPeriod,
           rate: finalRate,
         }
-        ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate), frrHighRate })
 
         const walletAvailable = (wallets[`funding:${currency}`] as any)?.availableBalance ?? 0
-        const settingsChanged = !_.isMatch(prevAutoRenew ?? {}, newAutoRenew)
 
-        if (!settingsChanged && walletAvailable < 1) {
+        // 循序呼叫避免 nonce 衝突：需要已借出與掛單中的金額，才能算出扣除保留金額後可自動借出的上限
+        const creditsRaw = await bitfinex.v2AuthReadFundingCredits({ currency })
+        const orders = await bitfinex.v2AuthReadFundingOffers({ currency })
+        const creditsForCalc = trace.creditsForCalc = _.chain(creditsRaw)
+          .filter(({ side }) => side === 1)
+          .map(credit => _.pick(credit, ['id', 'amount', 'rate', 'period', 'mtsOpening']))
+          .value()
+        const creditsAmountSum = trace.creditsAmountSum = _.sumBy(creditsForCalc, 'amount')
+        const ordersAmountSum = trace.ordersAmountSum = _.sumBy(orders, 'amount')
+        // 帳戶總金額 = 可用 + 已借出 + 掛單中（避免入金後利用率失真）
+        const totalAmount = trace.totalAmount = walletAvailable + creditsAmountSum + ordersAmountSum
+
+        // 保留金額：扣除保留金額後，若剩餘可借出上限低於 Bitfinex 最低借出金額，代表已無可借出的餘額，暫停自動借出
+        let reserveHold = false
+        if (cfg1.reserveAmount > 0) {
+          const reserveCap = floatFloor8(totalAmount - cfg1.reserveAmount)
+          if (reserveCap < RESERVE_MIN_LENDABLE) {
+            reserveHold = true
+          } else {
+            newAutoRenew.amount = cfg1.amount > 0 ? _.min([cfg1.amount, reserveCap])! : reserveCap
+          }
+        }
+        trace.reserveHold = reserveHold
+
+        ymlDump('newAutoRenew', { ...newAutoRenew, rateStr: rateStringify(newAutoRenew.rate), frrHighRate })
+        ymlDump('reserve', {
+          reserveAmount: cfg1.reserveAmount,
+          totalAmount: floatFormatDecimal(totalAmount, 3),
+          reserveHold,
+        })
+
+        const settingsChanged = !reserveHold && !_.isMatch(prevAutoRenew ?? {}, newAutoRenew)
+
+        if (reserveHold) {
+          trace.autoRenewChanged = !_.isNil(prevAutoRenew)
+          if (!_.isNil(prevAutoRenew)) {
+            await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
+            loggers.log(`Available (${floatFormatDecimal(totalAmount, 2)}) - reserve (${floatFormatDecimal(cfg1.reserveAmount, 2)}) < ${RESERVE_MIN_LENDABLE}, pausing auto-funding`)
+            await scheduler.wait(1000)
+          } else {
+            loggers.log(`Available (${floatFormatDecimal(totalAmount, 2)}) within reserve (${floatFormatDecimal(cfg1.reserveAmount, 2)}), auto-funding stays paused`)
+          }
+        } else if (!settingsChanged && walletAvailable < 1) {
           trace.autoRenewChanged = false
           loggers.log('Setting of auto-renew no change.')
         } else {
@@ -424,20 +466,12 @@ export async function main (): Promise<void> {
         const db1: Record<string, any> = db.notified?.[currency] ?? {}
         const autoRenew = _.pickBy(trace.newAutoRenew, _.isNumber)
 
-        // 循序呼叫避免 nonce 衝突
-        const creditsRaw = await bitfinex.v2AuthReadFundingCredits({ currency })
-        const orders = await bitfinex.v2AuthReadFundingOffers({ currency })
-        // 先保留數值 rate 供計算，再格式化供顯示
-        const creditsForCalc = _.chain(creditsRaw)
-          .filter(({ side }) => side === 1)
-          .map(credit => _.pick(credit, ['id', 'amount', 'rate', 'period', 'mtsOpening']))
-          .value()
-        const creditsAmountSum = _.sumBy(creditsForCalc, 'amount')
+        // 沿用前面計算自動借出上限時已取得的已借出／掛單資料，避免重複呼叫造成 nonce 衝突
+        const creditsForCalc = trace.creditsForCalc
+        const creditsAmountSum = trace.creditsAmountSum
         const creditIds = _.sortBy(_.map(creditsForCalc, 'id'))
-        const ordersAmountSum = _.sumBy(orders, 'amount')
-        // 帳戶總金額 = 可用 + 已借出 + 掛單中（避免入金後利用率失真）
-        // wallet.balance 是 Bitfinex 總餘額（含已借出與掛單），需用 availableBalance（可用）加上已部署金額
-        const totalAmount = ((wallet as any).availableBalance ?? 0) + creditsAmountSum + ordersAmountSum
+        const ordersAmountSum = trace.ordersAmountSum
+        const totalAmount = trace.totalAmount
         // 綜合 APR（基於帳戶總金額）、借出 APR（僅借出部分，不受入金稀釋）
         const weightedRateSum = _.sumBy(creditsForCalc, c => c.rate * c.amount)
         const portfolioApr = totalAmount > 0 ? weightedRateSum * 365 / totalAmount : 0
@@ -455,7 +489,7 @@ export async function main (): Promise<void> {
 
 投資額: ${floatFormatDecimal(totalAmount, 3)}
 已借出: ${floatFormatDecimal(creditsAmountSum, 3)} (${progressPercent(creditsAmountSum, totalAmount)})
-掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, totalAmount)})
+掛單中: ${floatFormatDecimal(ordersAmountSum, 3)} (${progressPercent(ordersAmountSum, totalAmount)})${cfg1.reserveAmount > 0 ? `\n保留金額: ${floatFormatDecimal(cfg1.reserveAmount, 3)} (${trace.reserveHold ? '自動借出已暫停' : '借出中'})` : ''}
 自動掛單設定:
     利率: ${floatFormatPercent(autoRenew.rate, 6)}
     APR: ${floatFormatPercent(autoRenew.rate * 365)}
