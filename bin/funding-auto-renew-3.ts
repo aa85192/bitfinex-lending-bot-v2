@@ -33,6 +33,11 @@ const RESERVE_MIN_LENDABLE = 50 // Bitfinex 自動借出最小金額（USD 或�
 const WINDOW_MS = 24 * 60 * 60 * 1000
 const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
 const LENDING_PERIOD = 120 // 固定借出天數
+// K 線的成交天期區間要對齊實際借出的天期：120 天的成交利率明顯高於 2~30 天，
+// 用短天期行情定價會嚴重低估。長天期成交較稀疏，整個 24 小時可能都沒有成交，
+// 此時退回短天期區間，避免因為沒有資料而完全停止掛單。
+const CANDLE_PERIOD = { start: 91, end: 120 }
+const CANDLE_PERIOD_FALLBACK = { start: 2, end: 30 }
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -141,19 +146,28 @@ export async function main (): Promise<void> {
         const windowStart = new Date(now - WINDOW_MS)
         const windowEnd = new Date(now)
 
-        const candles = await Bitfinex.v2CandlesHist({
-          aggregation: 30,
-          currency,
-          limit: 10000,
-          periodEnd: 30,
-          periodStart: 2,
-          sort: BitfinexSort.DESC,
-          start: windowStart,
-          end: windowEnd,
-          timeframe: '1m',
-        })
+        const fetchCandles = async (period: { start: number, end: number }) => {
+          const list = await Bitfinex.v2CandlesHist({
+            aggregation: 30,
+            currency,
+            limit: 10000,
+            periodEnd: period.end,
+            periodStart: period.start,
+            sort: BitfinexSort.DESC,
+            start: windowStart,
+            end: windowEnd,
+            timeframe: '1m',
+          })
+          return { list, valid: list.filter(c => c.volume > 0 && c.high > 0) }
+        }
 
-        const validCandles = candles.filter(c => c.volume > 0 && c.high > 0)
+        let candlePeriod = CANDLE_PERIOD
+        let { list: candles, valid: validCandles } = await fetchCandles(candlePeriod)
+        if (validCandles.length === 0) {
+          candlePeriod = CANDLE_PERIOD_FALLBACK
+          ;({ list: candles, valid: validCandles } = await fetchCandles(candlePeriod))
+          loggers.log(`[${currency}] No p${CANDLE_PERIOD.start}~p${CANDLE_PERIOD.end} candles in 24h, falling back to p${candlePeriod.start}~p${candlePeriod.end}`)
+        }
 
         const newestCandleTs = validCandles[0] != null ? +validCandles[0].mts : null
         const oldestCandleTs = validCandles.at(-1) != null ? +validCandles.at(-1)!.mts : null
@@ -170,7 +184,7 @@ export async function main (): Promise<void> {
           firstValidCandle: newestCandleTs != null ? dayjs(newestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
           lastValidCandle: oldestCandleTs != null ? dayjs(oldestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
           actualSpanHours,
-          missingMinutesApprox: _.max([0, 1440 - validCandles.length]),
+          candlePeriod: `p${candlePeriod.start}~p${candlePeriod.end}`,
           high24h: rateStringify(high24h),
         })
 
@@ -236,6 +250,7 @@ export async function main (): Promise<void> {
           method: 'frr_high24h_interpolation',
           frr: rateStringify(frr),
           high24h: rateStringify(high24h),
+          candlePeriod: `p${candlePeriod.start}~p${candlePeriod.end}`,
           rank: cfg1.rank,
           targetRate,
           targetRateStr: rateStringify(targetRate),
