@@ -22,8 +22,6 @@ jobs:
     environment: aa85192
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      actions: write
     steps:
       - name: Dump GitHub Context
         run: |
@@ -36,7 +34,6 @@ jobs:
           echo 'steps=${{ toJSON(steps) }}'
           echo 'vars=${{ toJSON(vars) }}'
       - uses: actions/checkout@v4
-      - uses: liskin/gh-workflow-keepalive@v1
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
