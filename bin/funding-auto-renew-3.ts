@@ -33,11 +33,10 @@ const RESERVE_MIN_LENDABLE = 50 // Bitfinex 自動借出最小金額（USD 或�
 const WINDOW_MS = 24 * 60 * 60 * 1000
 const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
 const LENDING_PERIOD = 120 // 固定借出天數
-// K 線的成交天期區間要對齊實際借出的天期：120 天的成交利率明顯高於 2~30 天，
-// 用短天期行情定價會嚴重低估。長天期成交較稀疏，整個 24 小時可能都沒有成交，
-// 此時退回短天期區間，避免因為沒有資料而完全停止掛單。
-const CANDLE_PERIOD = { start: 91, end: 120 }
-const CANDLE_PERIOD_FALLBACK = { start: 2, end: 30 }
+// 24h 最高成交利率直接取 funding ticker 的 HIGH，與 Bitfinex 網頁顯示的數字一致。
+// 不自己從長天期 K 線推算：長天期成交極稀疏，單筆小額成交就會把「最高」拉走。
+// K 線僅供診斷 log 使用，天期區間與 ticker HIGH 對齊（p2~p30）。
+const CANDLE_PERIOD = { start: 2, end: 30 }
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -134,12 +133,22 @@ export async function main (): Promise<void> {
         // 即時 FRR 改用 funding ticker（與 Bitfinex 網頁顯示一致）；funding stats hist 是歷史快照會落後
         const fundingTicker = await getFundingTicker({ currency })
         const frr = fundingTicker?.frr ?? 0
+        // 24h 最高成交利率：直接用 ticker 的 HIGH，與 Bitfinex 網頁顯示的數字一致
+        const high24h = fundingTicker?.high ?? 0
         ymlDump('fundingTicker', {
           currency,
           frr: rateStringify(frr),
           frrApr: floatFormatPercent(frr * 365),
+          high24h: rateStringify(high24h),
+          high24hApr: floatFormatPercent(high24h * 365),
+          low24h: rateStringify(fundingTicker?.low ?? 0),
+          last: rateStringify(fundingTicker?.last ?? 0),
           frrAmountAvailable: floatFormatDecimal(fundingTicker?.frrAmountAvailable ?? 0, 2),
         })
+
+        if (!(high24h > 0)) {
+          throw new SkipError(`[${currency}] funding ticker has no 24h high, skip.`)
+        }
 
         // 明確鎖定最近 24 小時視窗，避免 `limit: 1440` 跨越超過 24h
         const now = Date.now()
@@ -161,21 +170,13 @@ export async function main (): Promise<void> {
           return { list, valid: list.filter(c => c.volume > 0 && c.high > 0) }
         }
 
-        let candlePeriod = CANDLE_PERIOD
-        let { list: candles, valid: validCandles } = await fetchCandles(candlePeriod)
-        if (validCandles.length === 0) {
-          candlePeriod = CANDLE_PERIOD_FALLBACK
-          ;({ list: candles, valid: validCandles } = await fetchCandles(candlePeriod))
-          loggers.log(`[${currency}] No p${CANDLE_PERIOD.start}~p${CANDLE_PERIOD.end} candles in 24h, falling back to p${candlePeriod.start}~p${candlePeriod.end}`)
-        }
+        const { list: candles, valid: validCandles } = await fetchCandles(CANDLE_PERIOD)
 
         const newestCandleTs = validCandles[0] != null ? +validCandles[0].mts : null
         const oldestCandleTs = validCandles.at(-1) != null ? +validCandles.at(-1)!.mts : null
         const actualSpanHours = newestCandleTs != null && oldestCandleTs != null
           ? _.round((newestCandleTs - oldestCandleTs) / 3_600_000, 2)
           : null
-        const high24h = validCandles.length > 0 ? _.maxBy(validCandles, 'high')!.high : 0
-
         ymlDump('candleMetrics', {
           requestedWindowStart: dayjs(windowStart).utcOffset(8).format('M/D HH:mm:ss'),
           requestedWindowEnd: dayjs(windowEnd).utcOffset(8).format('M/D HH:mm:ss'),
@@ -184,8 +185,8 @@ export async function main (): Promise<void> {
           firstValidCandle: newestCandleTs != null ? dayjs(newestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
           lastValidCandle: oldestCandleTs != null ? dayjs(oldestCandleTs).utcOffset(8).format('M/D HH:mm:ss') : null,
           actualSpanHours,
-          candlePeriod: `p${candlePeriod.start}~p${candlePeriod.end}`,
-          high24h: rateStringify(high24h),
+          candlePeriod: `p${CANDLE_PERIOD.start}~p${CANDLE_PERIOD.end}`,
+          candleHigh24h: rateStringify(validCandles.length > 0 ? _.maxBy(validCandles, 'high')!.high : 0),
         })
 
         if (validCandles.length === 0) {
@@ -250,7 +251,7 @@ export async function main (): Promise<void> {
           method: 'frr_high24h_interpolation',
           frr: rateStringify(frr),
           high24h: rateStringify(high24h),
-          candlePeriod: `p${candlePeriod.start}~p${candlePeriod.end}`,
+          high24hSource: 'funding ticker HIGH',
           rank: cfg1.rank,
           targetRate,
           targetRateStr: rateStringify(targetRate),
