@@ -2,9 +2,11 @@
 yarn tsx ./bin/funding-auto-renew-3.ts
 
 程式決定借出利率的邏輯：
-1. 明確取得「最近 24 小時」的 1 分鐘 Funding Candles，取其中最高成交利率（24hHigh）
-2. 即時 FRR（funding ticker）與 24hHigh 兩點之間，用 rank 當作插值比例：
-   targetRate = FRR + rank × (24hHigh − FRR)
+1. 從 funding ticker 取得即時 FRR 與 24 小時最高成交利率（24hHigh），
+   兩者皆與 Bitfinex 網頁顯示的數字一致
+2. 在 FRR 與 24hHigh 兩點之間，用 rank 當作往 24hHigh 靠近的插值比例：
+   targetRate = FRR + rank × max(0, 24hHigh − FRR)
+   以 FRR 為下限：24hHigh 低於 FRR 時直接掛 FRR，不會掛得比浮動利率還低
 3. 夾住在 rateMin ~ rateMax 之間後，固定 120 天設定自動出借
 
 不使用 Funding Book：book 上只有未成交的掛單（利率太低沒人借的），不反映真實成交行情。
@@ -242,8 +244,11 @@ export async function main (): Promise<void> {
         }
         ymlDump('hourlyRates', hourlyRates)
 
-        // targetRate = FRR 與 24h 最高成交利率之間，以 rank 當作往 24h 最高值靠近的插值比例
-        const targetRate = frr + cfg1.rank * (high24h - frr)
+        // targetRate = FRR 與 24h 最高成交利率之間，以 rank 當作往 24h 最高值靠近的插值比例。
+        // 以 FRR 為下限：24h 最高低於 FRR 時，插值會把利率拉到 FRR 以下，
+        // 那還不如直接用 FRR 浮動利率出借，因此此時直接掛 FRR。
+        const frrFloorApplied = high24h < frr
+        const targetRate = frr + cfg1.rank * _.max([0, high24h - frr])!
         const finalRate = _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)
         const finalPeriod = LENDING_PERIOD
 
@@ -253,11 +258,13 @@ export async function main (): Promise<void> {
           high24h: rateStringify(high24h),
           high24hSource: 'funding ticker HIGH',
           rank: cfg1.rank,
+          frrFloorApplied,
           targetRate,
           targetRateStr: rateStringify(targetRate),
           finalRate,
           finalRateStr: rateStringify(finalRate),
         })
+        if (frrFloorApplied) loggers.log(`[${currency}] 24h high (${rateStringify(high24h)}) < FRR (${rateStringify(frr)}), using FRR as floor`)
 
         const newAutoRenew = trace.newAutoRenew = {
           amount: cfg1.amount,
