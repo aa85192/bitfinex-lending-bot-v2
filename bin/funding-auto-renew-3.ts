@@ -5,9 +5,11 @@ yarn tsx ./bin/funding-auto-renew-3.ts
 1. 從 funding ticker 取得即時 FRR 與 24 小時最高成交利率（24hHigh），
    兩者皆與 Bitfinex 網頁顯示的數字一致
 2. 在 FRR 與 24hHigh 兩點之間，用 rank 當作往 24hHigh 靠近的插值比例：
-   targetRate = FRR + rank × max(0, 24hHigh − FRR)
-   以 FRR 為下限：24hHigh 低於 FRR 時直接掛 FRR，不會掛得比浮動利率還低
-3. 夾住在 rateMin ~ rateMax 之間後，固定 120 天設定自動出借
+   targetRate = FRR + rank × (24hHigh − FRR)
+   不設 FRR 下限，行情冷時掛得比 FRR 低才借得出去，避免資金閒置
+3. 夾住在 rateMin ~ rateMax 之間後設定自動出借，天期：
+   - 利率 ≥ FRR：固定 120 天，鎖住這個好價格
+   - 利率 < FRR：用 period 對照表插值取短天期，過幾天就能重新定價
 
 不使用 Funding Book：book 上只有未成交的掛單（利率太低沒人借的），不反映真實成交行情。
 */
@@ -49,12 +51,19 @@ function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
 }
 
+// 利率低於 FRR 時，用這張「利率 → 天數」對照表插值決定天數（利率越低、天數越短）
+const ZodConfigPeriod = z.record(
+  z.coerce.number().int().min(2).max(120),
+  z.number().positive(),
+).default({})
+
 const ZodConfigCurrency = z.object({
   amount: z.coerce.number().min(0).default(0),
   reserveAmount: z.coerce.number().min(0).default(0),
-  rank: z.coerce.number().min(0).max(1).default(0.8),
+  rank: z.coerce.number().min(0).max(1).default(0.5),
   rateMax: z.coerce.number().min(RATE_MIN).default(0.01),
   rateMin: z.coerce.number().min(RATE_MIN).default(0.0002),
+  period: ZodConfigPeriod,
 })
 
 const ZodConfig = z.record(z.string(), ZodConfigCurrency).default({})
@@ -245,12 +254,13 @@ export async function main (): Promise<void> {
         ymlDump('hourlyRates', hourlyRates)
 
         // targetRate = FRR 與 24h 最高成交利率之間，以 rank 當作往 24h 最高值靠近的插值比例。
-        // 以 FRR 為下限：24h 最高低於 FRR 時，插值會把利率拉到 FRR 以下，
-        // 那還不如直接用 FRR 浮動利率出借，因此此時直接掛 FRR。
-        const frrFloorApplied = high24h < frr
-        const targetRate = frr + cfg1.rank * _.max([0, high24h - frr])!
+        // 不設 FRR 下限：行情冷時掛得比 FRR 低才借得出去，不會讓資金一直閒置。
+        const targetRate = frr + cfg1.rank * (high24h - frr)
         const finalRate = _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)
-        const finalPeriod = LENDING_PERIOD
+        // 低於 FRR 代表現在行情差，改用對照表的短天期，過幾天就能重新定價；
+        // 高於 FRR 才值得用 120 天鎖住這個價格。
+        const belowFrr = finalRate < frr
+        const finalPeriod = belowFrr ? rateToPeriod(cfg1.period, finalRate) : LENDING_PERIOD
 
         ymlDump('pricing', {
           method: 'frr_high24h_interpolation',
@@ -258,13 +268,15 @@ export async function main (): Promise<void> {
           high24h: rateStringify(high24h),
           high24hSource: 'funding ticker HIGH',
           rank: cfg1.rank,
-          frrFloorApplied,
           targetRate,
           targetRateStr: rateStringify(targetRate),
           finalRate,
           finalRateStr: rateStringify(finalRate),
+          belowFrr,
+          finalPeriod,
+          periodSource: belowFrr ? 'rateToPeriod (低於 FRR)' : `fixed ${LENDING_PERIOD}d`,
         })
-        if (frrFloorApplied) loggers.log(`[${currency}] 24h high (${rateStringify(high24h)}) < FRR (${rateStringify(frr)}), using FRR as floor`)
+        if (belowFrr) loggers.log(`[${currency}] rate ${rateStringify(finalRate)} < FRR ${rateStringify(frr)}, using ${finalPeriod}d from period table`)
 
         const newAutoRenew = trace.newAutoRenew = {
           amount: cfg1.amount,
@@ -414,6 +426,22 @@ export async function main (): Promise<void> {
 
   ymlDump('newDb', db)
   await bitfinex.v2AuthWriteSettingsSet({ [DB_KEY]: ZodDb.parse(db) as any }).catch(loggers.error)
+}
+
+export function rateToPeriod (periodMap: z.output<typeof ZodConfigPeriod>, rateTarget: number): number {
+  const ctxPeriod: Record<string, number | null> = { lower: null, target: null, upper: null }
+  for (const entry of _.entries(periodMap)) {
+    const [period, rate] = [_.toSafeInteger(entry[0]), _.toFinite(entry[1])]
+    if (rateTarget >= rate) ctxPeriod.lower = _.max([ctxPeriod.lower ?? period, period])
+    if (rateTarget <= rate) ctxPeriod.upper = _.min([ctxPeriod.upper ?? period, period])
+  }
+
+  if (_.isNil(ctxPeriod.lower)) ctxPeriod.target = 2
+  else if (_.isNil(ctxPeriod.upper)) ctxPeriod.target = ctxPeriod.lower
+  else if (ctxPeriod.lower === ctxPeriod.upper) ctxPeriod.target = ctxPeriod.lower
+  else ctxPeriod.target = Math.trunc(ctxPeriod.lower + (ctxPeriod.upper - ctxPeriod.lower) * (rateTarget - periodMap[ctxPeriod.lower]) / (periodMap[ctxPeriod.upper] - periodMap[ctxPeriod.lower]))
+
+  return _.clamp(ctxPeriod.target, 2, 120)
 }
 
 class NotMainModuleError extends Error {}
