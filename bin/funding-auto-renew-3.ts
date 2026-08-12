@@ -23,7 +23,7 @@ import { readFileSync } from 'node:fs'
 import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
-import { getFundingTicker } from '../lib/bitfinex.mjs'
+import { getFundingTicker, rest } from '../lib/bitfinex.mjs'
 import { dayjs } from '../lib/dayjs.mjs'
 import { floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
@@ -37,6 +37,17 @@ const RESERVE_MIN_LENDABLE = 50 // Bitfinex 自動借出最小金額（USD 或�
 const WINDOW_MS = 24 * 60 * 60 * 1000
 const RECENT_WINDOW_MS = 2 * 60 * 60 * 1000
 const LENDING_PERIOD = 120 // 固定借出天數
+const BUCKET_MS = 30 * 60 * 1000 // 時間 bucket 大小：30 分鐘
+const WINDOW_BUCKETS = Math.ceil(WINDOW_MS / BUCKET_MS) // 48 buckets
+const WEIGHT_SCALE = 1_000_000n       // 時間權重精度 1e-6
+const RATE_SCALE = 100_000_000n       // 利率精度 1e-8
+const TIME_WEIGHT_MIN_BI = 850_000n   // 些微衰減：0.85（24h 前的 bucket）
+const TIME_WEIGHT_MAX_BI = 1_000_000n // 最新 bucket：1.0
+// 供 diagnostic log 使用
+const TIME_WEIGHT_MIN = Number(TIME_WEIGHT_MIN_BI) / 1e6
+const TIME_WEIGHT_MAX = Number(TIME_WEIGHT_MAX_BI) / 1e6
+// 既有掛單若比目前目標利率高出這個比例，視為行情已走掉的殭屍單，取消後讓它以新利率重掛
+const STALE_OFFER_RATIO = 1.05
 // 24h 最高成交利率直接取 funding ticker 的 HIGH，與 Bitfinex 網頁顯示的數字一致。
 // 不自己從長天期 K 線推算：長天期成交極稀疏，單筆小額成交就會把「最高」拉走。
 // K 線僅供診斷 log 使用，天期區間與 ticker HIGH 對齊（p2~p30）。
@@ -49,6 +60,94 @@ const bitfinex = new Bitfinex({
 
 function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
+}
+
+;(BigInt as any).prototype.toJSON ??= function () { return this.toString() }
+
+function bigintAbs (a: bigint): bigint {
+  return a < 0n ? -a : a
+}
+
+// 線性時間權重（BigInt 版）：最新 bucket = TIME_WEIGHT_MAX_BI，24h 前 = TIME_WEIGHT_MIN_BI
+function linearTimeWeightBI (mts: number, nowTs: number): bigint {
+  const bucketIndex = Math.min(
+    Math.max(Math.floor((nowTs - mts) / BUCKET_MS), 0),
+    WINDOW_BUCKETS - 1,
+  )
+  const decay = (TIME_WEIGHT_MAX_BI - TIME_WEIGHT_MIN_BI) * BigInt(bucketIndex) / BigInt(WINDOW_BUCKETS - 1)
+  return TIME_WEIGHT_MAX_BI - decay
+}
+
+interface RangeEntryBI { low: bigint, high: bigint, vol: bigint }
+
+// 把蠟燭轉成 [low, high, vol] BigInt 區間，合併相同區間，成交量 × 時間權重
+function buildRangesBI (
+  candles: Array<{ mts: Date, open: number, close: number, high: number, low: number, volume: number }>,
+  nowTs: number,
+  applyTimeWeight: boolean,
+): RangeEntryBI[] {
+  const rangeMap = new Map<string, bigint>()
+  for (const c of candles) {
+    if (c.volume <= 0) continue
+    const lowN = _.min([c.open, c.close, c.high, c.low])!
+    const highN = _.max([c.open, c.close, c.high, c.low])!
+    if (highN <= 0 || lowN <= 0) continue
+    const low = BigInt(_.round(lowN * 1e8))
+    const high = BigInt(_.round(highN * 1e8))
+    const volBI = BigInt(_.round(c.volume * 1e8))
+    const tw = applyTimeWeight ? linearTimeWeightBI(+c.mts, nowTs) : WEIGHT_SCALE
+    const weightedVol = volBI * tw / WEIGHT_SCALE
+    if (weightedVol <= 0n) continue
+    const key = `${low}|${high}`
+    rangeMap.set(key, (rangeMap.get(key) ?? 0n) + weightedVol)
+  }
+  return [...rangeMap.entries()]
+    .map(([key, vol]) => {
+      const [lowStr, highStr] = key.split('|')
+      return { low: BigInt(lowStr), high: BigInt(highStr), vol }
+    })
+    .filter(r => r.vol > 0n)
+    .sort((a, b) =>
+      a.low !== b.low
+        ? (a.low < b.low ? -1 : 1)
+        : (a.high < b.high ? -1 : a.high > b.high ? 1 : 0))
+}
+
+// 二分搜尋（BigInt 版，含 +1n 端點修正）：找出累積加權體積 ≈ totalVol * rank 的利率
+function binarySearchRateBI (
+  ranges: RangeEntryBI[],
+  totalVol: bigint,
+  rank: bigint, // 單位 RATE_SCALE (1e8)，例如 rank=0.8 → 80_000_000n
+): bigint {
+  if (ranges.length === 0 || totalVol <= 0n) return 0n
+  let lo = ranges[0].low
+  let hi = ranges[0].high
+  for (const r of ranges) {
+    if (r.low < lo) lo = r.low
+    if (r.high > hi) hi = r.high
+  }
+  let bestRate = lo
+  let bestDiff: bigint | null = null
+  while (lo <= hi) {
+    const mid = (lo + hi) / 2n
+    let midVol = 0n
+    for (const { low, high, vol } of ranges) {
+      if (mid < low) break
+      midVol += mid >= high
+        ? vol
+        : vol * (mid - low + 1n) / (high - low + 1n)
+    }
+    const midRank = midVol * RATE_SCALE / totalVol
+    const diff = bigintAbs(midRank - rank)
+    if (bestDiff === null || diff < bestDiff) {
+      bestDiff = diff
+      bestRate = mid
+    }
+    if (midRank === rank) break
+    if (rank < midRank) hi = mid - 1n
+    else lo = mid + 1n
+  }
+  return bestRate
 }
 
 // 利率低於 FRR 時，用這張「利率 → 天數」對照表插值決定天數（利率越低、天數越短）
@@ -204,7 +303,36 @@ export async function main (): Promise<void> {
           throw new SkipError(`[${currency}] No valid candle data in the last 24 hours.`)
         }
 
+        // 以「實際成交量的百分位」定價：rank 0.8 代表價格高於 80% 的成交量。
+        // 不用 FRR 當錨點：FRR 是既有未到期放貸的加權平均，行情下跌時會遠高於真實成交價，
+        // 拿它定價會掛出整個成交區間之外的單，永遠不會成交。
+        const weightedRanges = buildRangesBI(validCandles, now, true)
+        const rawRanges = buildRangesBI(validCandles, now, false)
+        const totalWeightedVol = weightedRanges.reduce((s, r) => s + r.vol, 0n)
+        const totalRawVol = rawRanges.reduce((s, r) => s + r.vol, 0n)
+
+        if (weightedRanges.length === 0 || totalWeightedVol <= 0n) {
+          throw new SkipError(`[${currency}] No traded volume in the last 24 hours.`)
+        }
+
+        const rankBI = BigInt(_.round(cfg1.rank * 1e8))
+        const targetRate = Number(binarySearchRateBI(weightedRanges, totalWeightedVol, rankBI)) / 1e8
+
         // === 診斷 log ===
+
+        // 0. 成交量百分位分布（有時間權重）
+        const percentiles = [0.1, 0.25, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99]
+        const pctMap: Record<string, string> = {}
+        for (const p of percentiles) {
+          pctMap[`p${_.round(p * 100)}`] = rateStringify(Number(binarySearchRateBI(weightedRanges, totalWeightedVol, BigInt(_.round(p * 1e8)))) / 1e8)
+        }
+        ymlDump('distribution', pctMap)
+
+        const rawPctMap: Record<string, string> = {}
+        for (const p of percentiles) {
+          rawPctMap[`p${_.round(p * 100)}`] = rateStringify(Number(binarySearchRateBI(rawRanges, totalRawVol, BigInt(_.round(p * 1e8)))) / 1e8)
+        }
+        ymlDump('distributionNoDecay', rawPctMap)
 
         // 1. 最近 2 小時 vs 之前 22 小時（都限定在最近 24 小時視窗內）
         const recentCutoff = now - RECENT_WINDOW_MS
@@ -253,9 +381,6 @@ export async function main (): Promise<void> {
         }
         ymlDump('hourlyRates', hourlyRates)
 
-        // targetRate = FRR 與 24h 最高成交利率之間，以 rank 當作往 24h 最高值靠近的插值比例。
-        // 不設 FRR 下限：行情冷時掛得比 FRR 低才借得出去，不會讓資金一直閒置。
-        const targetRate = frr + cfg1.rank * (high24h - frr)
         const finalRate = _.clamp(targetRate, cfg1.rateMin, cfg1.rateMax)
         // 低於 FRR 代表現在行情差，改用對照表的短天期，過幾天就能重新定價；
         // 高於 FRR 才值得用 120 天鎖住這個價格。
@@ -263,15 +388,14 @@ export async function main (): Promise<void> {
         const finalPeriod = belowFrr ? rateToPeriod(cfg1.period, finalRate) : LENDING_PERIOD
 
         ymlDump('pricing', {
-          method: 'frr_high24h_interpolation',
-          frr: rateStringify(frr),
-          high24h: rateStringify(high24h),
-          high24hSource: 'funding ticker HIGH',
+          method: 'candle_volume_percentile',
           rank: cfg1.rank,
           targetRate,
           targetRateStr: rateStringify(targetRate),
           finalRate,
           finalRateStr: rateStringify(finalRate),
+          frr: rateStringify(frr),
+          high24h: rateStringify(high24h),
           belowFrr,
           finalPeriod,
           periodSource: belowFrr ? 'rateToPeriod (低於 FRR)' : `fixed ${LENDING_PERIOD}d`,
@@ -350,6 +474,33 @@ export async function main (): Promise<void> {
             status: 1,
           }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
           await scheduler.wait(1000)
+        }
+
+        // 殭屍掛單：Bitfinex 的 auto-renew 只影響「之後新掛的單」，既有掛單會永遠保留原利率。
+        // 行情下跌後那些單就卡在市場外永遠不會成交，所以主動取消，讓資金回到可用餘額重新掛出。
+        if (!reserveHold) {
+          const staleOffers = orders.filter((o: any) => o.rate > finalRate * STALE_OFFER_RATIO)
+          if (staleOffers.length > 0) {
+            ymlDump('staleOffers', staleOffers.map((o: any) => ({
+              id: o.id,
+              amount: floatFormatDecimal(o.amount, 2),
+              rate: rateStringify(o.rate),
+              period: o.period,
+            })))
+            for (const offer of staleOffers) {
+              await rest.cancelFundingOffer({ id: offer.id })
+                .then(() => loggers.log(`Cancelled stale offer ${offer.id}: ${floatFormatDecimal(offer.amount, 2)} @ ${rateStringify(offer.rate)} (target ${rateStringify(finalRate)})`))
+                .catch((err: any) => loggers.error([_.set(err, 'data.staleOffer', offer)]))
+              await scheduler.wait(1000)
+            }
+            // 取消後資金回到可用餘額，重新觸發自動掛單讓它以新利率掛出
+            await bitfinex.v2AuthWriteFundingAuto({
+              ...newAutoRenew,
+              rate: floatFloor8(newAutoRenew.rate * 100),
+              status: 1,
+            }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
+            await scheduler.wait(1000)
+          }
         }
       } catch (err) {
         if (!(err instanceof SkipError)) throw err
