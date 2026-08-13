@@ -49,9 +49,10 @@ const TIME_WEIGHT_MAX = Number(TIME_WEIGHT_MAX_BI) / 1e6
 // 既有掛單若比目前目標利率高出這個比例，視為行情已走掉的殭屍單，取消後讓它以新利率重掛
 const STALE_OFFER_RATIO = 1.05
 // 24h 最高成交利率直接取 funding ticker 的 HIGH，與 Bitfinex 網頁顯示的數字一致。
-// 不自己從長天期 K 線推算：長天期成交極稀疏，單筆小額成交就會把「最高」拉走。
-// K 線僅供診斷 log 使用，天期區間與 ticker HIGH 對齊（p2~p30）。
-const CANDLE_PERIOD = { start: 2, end: 30 }
+// K 線僅供診斷 log：天期區間對齊實際借出的 120 天，因為長短天期的行情差很多
+// （實測同一時間 2~30 天中位數 7.27%、91~120 天中位數 11.11%），
+// 用短天期行情判讀長天期的單會嚴重低估。
+const CANDLE_PERIOD = { start: 91, end: 120 }
 const bitfinex = new Bitfinex({
   apiKey: getenv('BITFINEX_API_KEY'),
   apiSecret: getenv('BITFINEX_API_SECRET'),
@@ -303,9 +304,12 @@ export async function main (): Promise<void> {
           throw new SkipError(`[${currency}] No valid candle data in the last 24 hours.`)
         }
 
-        // 以「實際成交量的百分位」定價：rank 0.8 代表價格高於 80% 的成交量。
-        // 不用 FRR 當錨點：FRR 是既有未到期放貸的加權平均，行情下跌時會遠高於真實成交價，
-        // 拿它定價會掛出整個成交區間之外的單，永遠不會成交。
+        // 定價：FRR 與 24h 最高成交利率之間，以 rank 當作插值比例（rank 0.5 = 正中間）。
+        // 兩個錨點都取自 funding ticker，與 Bitfinex 網頁顯示的數字一致。
+        const targetRate = frr + cfg1.rank * (high24h - frr)
+
+        // === 診斷 log ===
+        // 以下百分位分布不參與定價，只用來對照「目標利率落在 120 天市場的哪個位置」
         const weightedRanges = buildRangesBI(validCandles, now, true)
         const rawRanges = buildRangesBI(validCandles, now, false)
         const totalWeightedVol = weightedRanges.reduce((s, r) => s + r.vol, 0n)
@@ -314,11 +318,6 @@ export async function main (): Promise<void> {
         if (weightedRanges.length === 0 || totalWeightedVol <= 0n) {
           throw new SkipError(`[${currency}] No traded volume in the last 24 hours.`)
         }
-
-        const rankBI = BigInt(_.round(cfg1.rank * 1e8))
-        const targetRate = Number(binarySearchRateBI(weightedRanges, totalWeightedVol, rankBI)) / 1e8
-
-        // === 診斷 log ===
 
         // 0. 成交量百分位分布（有時間權重）
         const percentiles = [0.1, 0.25, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99]
@@ -387,15 +386,29 @@ export async function main (): Promise<void> {
         const belowFrr = finalRate < frr
         const finalPeriod = belowFrr ? rateToPeriod(cfg1.period, finalRate) : LENDING_PERIOD
 
+        // 目標利率落在「實際借出天期」市場成交量的哪個百分位，用來判讀掛得出去的機率
+        const targetPercentile = totalWeightedVol > 0n
+          ? (() => {
+              const targetBI = BigInt(_.round(targetRate * 1e8))
+              let vol = 0n
+              for (const { low, high, vol: v } of weightedRanges) {
+                if (targetBI < low) break
+                vol += targetBI >= high ? v : v * (targetBI - low + 1n) / (high - low + 1n)
+              }
+              return Number(vol * 10000n / totalWeightedVol) / 10000
+            })()
+          : null
+
         ymlDump('pricing', {
-          method: 'candle_volume_percentile',
+          method: 'frr_high24h_interpolation',
           rank: cfg1.rank,
+          frr: rateStringify(frr),
+          high24h: rateStringify(high24h),
           targetRate,
           targetRateStr: rateStringify(targetRate),
           finalRate,
           finalRateStr: rateStringify(finalRate),
-          frr: rateStringify(frr),
-          high24h: rateStringify(high24h),
+          targetPercentileInMarket: targetPercentile != null ? floatFormatPercent(targetPercentile) : null,
           belowFrr,
           finalPeriod,
           periodSource: belowFrr ? 'rateToPeriod (低於 FRR)' : `fixed ${LENDING_PERIOD}d`,
