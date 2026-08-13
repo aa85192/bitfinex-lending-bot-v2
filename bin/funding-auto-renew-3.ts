@@ -493,7 +493,11 @@ export async function main (): Promise<void> {
                 .catch((err: any) => loggers.error([_.set(err, 'data.staleOffer', offer)]))
               await scheduler.wait(1000)
             }
-            // 取消後資金回到可用餘額，重新觸發自動掛單讓它以新利率掛出
+            // 取消後資金回到可用餘額，重新觸發自動掛單讓它以新利率掛出。
+            // 此時 auto-renew 已是啟用狀態，直接送 status:1 會被 Bitfinex 以
+            // 「Auto-renew already active」(10001) 拒絕，必須先停用再啟用。
+            await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
+            await scheduler.wait(1000)
             await bitfinex.v2AuthWriteFundingAuto({
               ...newAutoRenew,
               rate: floatFloor8(newAutoRenew.rate * 100),
