@@ -21,7 +21,7 @@ jobs:
     # 這個名字必須跟 repo 的 Environments 名稱一樣
     environment: aa85192
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - name: Dump GitHub Context
         run: |
