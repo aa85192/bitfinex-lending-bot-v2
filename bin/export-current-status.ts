@@ -9,7 +9,7 @@ INPUT_CURRENCYS=USD,UST yarn tsx ./bin/export-current-status.ts
 import { getenv } from '../lib/dotenv.mjs'
 
 import { Bitfinex, PlatformStatus } from '@taichunmin/bitfinex'
-import { rest } from '../lib/bitfinex.mjs'
+import { rest, withNonceRetry as withNonceRetryRaw } from '../lib/bitfinex.mjs'
 import { fetchTwdRate } from '../lib/twd-rate.mjs'
 import { promises as fsPromises } from 'node:fs'
 import { gzip } from 'node:zlib'
@@ -17,24 +17,8 @@ import { promisify } from 'node:util'
 
 const gzipAsync = promisify(gzip)
 
-async function withNonceRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      return await fn()
-    } catch (err: any) {
-      const msg = String(err?.message ?? '')
-      const isNonce = msg.includes('10114') || msg.toLowerCase().includes('nonce')
-      if (isNonce && attempt < maxRetries - 1) {
-        const delay = (attempt + 1) * 4000 + Math.random() * 2000
-        console.warn(`[export-current-status] nonce conflict, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt + 2}/${maxRetries})`)
-        await new Promise(resolve => setTimeout(resolve, delay))
-        continue
-      }
-      throw err
-    }
-  }
-  throw new Error('unreachable')
-}
+const withNonceRetry = async <T>(fn: () => Promise<T>): Promise<T> =>
+  await withNonceRetryRaw(fn, { label: 'export-current-status' })
 
 const outdir = new URL('../dist/current-status/', import.meta.url)
 const bitfinex = new Bitfinex({

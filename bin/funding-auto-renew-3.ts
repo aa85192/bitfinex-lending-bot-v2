@@ -23,7 +23,7 @@ import { readFileSync } from 'node:fs'
 import { scheduler } from 'node:timers/promises'
 import * as url from 'node:url'
 import { z } from 'zod'
-import { getFundingTicker, rest } from '../lib/bitfinex.mjs'
+import { getFundingTicker, rest, withNonceRetry as withNonceRetryRaw } from '../lib/bitfinex.mjs'
 import { dayjs } from '../lib/dayjs.mjs'
 import { floatFloor8, floatFormatDecimal, floatFormatPercent, floatIsEqual, parseYaml, progressPercent, rateStringify } from '../lib/helper.mjs'
 import { createLoggersByUrl, ymlStringify } from '../lib/logger.mjs'
@@ -62,6 +62,15 @@ const bitfinex = new Bitfinex({
 function ymlDump (key: string, val: any): void {
   loggers.log({ [key]: val })
 }
+
+// 與 gh-pages 共用同一把 API key，兩個 workflow 同時啟動時 auth 呼叫會撞 nonce，
+// 所以每個 auth 呼叫都包一層重試（詳見 lib/bitfinex.mjs 的 withNonceRetry）
+const nonceRetry = async <T>(fn: () => Promise<T>): Promise<T> =>
+  await withNonceRetryRaw(fn, { label: filename })
+
+// workflow 會在同一次觸發內重跑多輪（補回被 GitHub 節流丟掉的排程），
+// 每輪都發 Telegram 會讓通知量變成倍數，所以只有最後一輪才通知。
+const notifyEnabled = getenv('INPUT_NOTIFY', '1') !== '0'
 
 ;(BigInt as any).prototype.toJSON ??= function () { return this.toString() }
 
@@ -215,10 +224,10 @@ export async function main (): Promise<void> {
     if (currency in reserveAmountFile) cfg1.reserveAmount = reserveAmountFile[currency]
   }
 
-  const db = ZodDb.parse((await bitfinex.v2AuthReadSettings([DB_KEY]).catch(() => ({})))[DB_KEY.slice(4)])
+  const db = ZodDb.parse((await nonceRetry(async () => await bitfinex.v2AuthReadSettings([DB_KEY])).catch(() => ({})))[DB_KEY.slice(4)])
   ymlDump('db', db)
 
-  const wallets = _.mapKeys(await bitfinex.v2AuthReadWallets(), ({ type, currency }) => `${type}:${currency}`)
+  const wallets = _.mapKeys(await nonceRetry(async () => await bitfinex.v2AuthReadWallets()), ({ type, currency }) => `${type}:${currency}`)
   ymlDump('wallets', wallets)
 
   for (const [currency, cfg1] of _.entries(cfg)) {
@@ -232,7 +241,7 @@ export async function main (): Promise<void> {
       })
 
       try {
-        const prevAutoRenew = await bitfinex.v2AuthReadFundingAutoStatus({ currency })
+        const prevAutoRenew = await nonceRetry(async () => await bitfinex.v2AuthReadFundingAutoStatus({ currency }))
         if (_.isNil(prevAutoRenew)) ymlDump('prevAutoRenew', { status: false })
         else {
           ymlDump('prevAutoRenew', {
@@ -425,8 +434,8 @@ export async function main (): Promise<void> {
         const walletAvailable = (wallets[`funding:${currency}`] as any)?.availableBalance ?? 0
 
         // 循序呼叫避免 nonce 衝突：需要已借出與掛單中的金額，才能算出扣除保留金額後可自動借出的上限
-        const creditsRaw = await bitfinex.v2AuthReadFundingCredits({ currency })
-        const orders = await bitfinex.v2AuthReadFundingOffers({ currency })
+        const creditsRaw = await nonceRetry(async () => await bitfinex.v2AuthReadFundingCredits({ currency }))
+        const orders = await nonceRetry(async () => await bitfinex.v2AuthReadFundingOffers({ currency }))
         const creditsForCalc = trace.creditsForCalc = _.chain(creditsRaw)
           .filter(({ side }) => side === 1)
           .map(credit => _.pick(credit, ['id', 'amount', 'rate', 'period', 'mtsOpening']))
@@ -460,7 +469,7 @@ export async function main (): Promise<void> {
         if (reserveHold) {
           trace.autoRenewChanged = !_.isNil(prevAutoRenew)
           if (!_.isNil(prevAutoRenew)) {
-            await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
+            await nonceRetry(async () => await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 }))
             loggers.log(`Available (${floatFormatDecimal(totalAmount, 2)}) - reserve (${floatFormatDecimal(cfg1.reserveAmount, 2)}) < ${RESERVE_MIN_LENDABLE}, pausing auto-funding`)
             await scheduler.wait(1000)
           } else {
@@ -475,17 +484,17 @@ export async function main (): Promise<void> {
             // 利率/天期有變更：Bitfinex 自動掛單需先停用才能改利率，但「不」取消既有掛單。
             // 停用本身不會取消掛單，既有掛單維持原利率自然成交或到期，避免拆單空窗把全錢包閒置；
             // 重新啟用後 Bitfinex 會以新利率持續自動續借歸還與閒置資金。
-            if (!_.isNil(prevAutoRenew)) await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
+            if (!_.isNil(prevAutoRenew)) await nonceRetry(async () => await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 }))
             loggers.log(`Rate changed to ${rateStringify(newAutoRenew.rate)}, updating auto-funding (offers kept)`)
           } else {
             // 設定未變，但有閒置資金（如到期歸還），直接重新觸發自動掛單讓 Bitfinex 掛出閒置資金
             loggers.log(`Available balance ${floatFormatDecimal(walletAvailable, 2)}, re-triggering auto-funding`)
           }
-          await bitfinex.v2AuthWriteFundingAuto({
+          await nonceRetry(async () => await bitfinex.v2AuthWriteFundingAuto({
             ...newAutoRenew,
             rate: floatFloor8(newAutoRenew.rate * 100), // API 要的是百分比
             status: 1,
-          }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
+          })).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
           await scheduler.wait(1000)
         }
 
@@ -501,7 +510,7 @@ export async function main (): Promise<void> {
               period: o.period,
             })))
             for (const offer of staleOffers) {
-              await rest.cancelFundingOffer({ id: offer.id })
+              await nonceRetry(async () => await rest.cancelFundingOffer({ id: offer.id }))
                 .then(() => loggers.log(`Cancelled stale offer ${offer.id}: ${floatFormatDecimal(offer.amount, 2)} @ ${rateStringify(offer.rate)} (target ${rateStringify(finalRate)})`))
                 .catch((err: any) => loggers.error([_.set(err, 'data.staleOffer', offer)]))
               await scheduler.wait(1000)
@@ -509,13 +518,13 @@ export async function main (): Promise<void> {
             // 取消後資金回到可用餘額，重新觸發自動掛單讓它以新利率掛出。
             // 此時 auto-renew 已是啟用狀態，直接送 status:1 會被 Bitfinex 以
             // 「Auto-renew already active」(10001) 拒絕，必須先停用再啟用。
-            await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 })
+            await nonceRetry(async () => await bitfinex.v2AuthWriteFundingAuto({ currency, status: 0 }))
             await scheduler.wait(1000)
-            await bitfinex.v2AuthWriteFundingAuto({
+            await nonceRetry(async () => await bitfinex.v2AuthWriteFundingAuto({
               ...newAutoRenew,
               rate: floatFloor8(newAutoRenew.rate * 100),
               status: 1,
-            }).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
+            })).catch(err => { throw _.set(err, 'data.newAutoRenew', newAutoRenew) })
             await scheduler.wait(1000)
           }
         }
@@ -525,7 +534,7 @@ export async function main (): Promise<void> {
       }
 
       const wallet = wallets[`funding:${currency}`] ?? { balance: 0 }
-      if (wallet.balance >= Number.EPSILON && !_.isNil(trace.newAutoRenew)) {
+      if (notifyEnabled && wallet.balance >= Number.EPSILON && !_.isNil(trace.newAutoRenew)) {
         const db1: Record<string, any> = db.notified?.[currency] ?? {}
         const autoRenew = _.pickBy(trace.newAutoRenew, _.isNumber)
 
@@ -593,7 +602,7 @@ export async function main (): Promise<void> {
   }
 
   ymlDump('newDb', db)
-  await bitfinex.v2AuthWriteSettingsSet({ [DB_KEY]: ZodDb.parse(db) as any }).catch(loggers.error)
+  await nonceRetry(async () => await bitfinex.v2AuthWriteSettingsSet({ [DB_KEY]: ZodDb.parse(db) as any })).catch(loggers.error)
 }
 
 export function rateToPeriod (periodMap: z.output<typeof ZodConfigPeriod>, rateTarget: number): number {
