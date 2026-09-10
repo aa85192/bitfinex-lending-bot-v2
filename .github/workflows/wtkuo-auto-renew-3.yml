@@ -7,24 +7,7 @@ on:
     # 避開整點時間，因為有可能會有時間上的延誤
     - cron: '6-56/10 * * * *'
 
-# GitHub 對排程事件節流得很兇，這個 cron 從來沒有真的每 10 分鐘跑過：
-# 2026-08 中旬約 36~52 次/天，8/23 之後（repo 停止有新的 push）掉到 6~9 次/天，
-# 兩次執行最長間隔 4h37m，資金歸還後會閒置好幾個小時。
-# 排程頻率不是我們能控制的，所以改成「一次觸發覆蓋一段時間」：
-# 同一個 job 內以 LOOP_INTERVAL 為間隔重跑 LOOP_COUNT 輪，把 10 分鐘的節奏補回來。
-concurrency:
-  group: wtkuo-auto-renew-3
-  # 不可以設成 true：取消有可能正好落在 auto-funding「先停用再啟用」的空檔，
-  # 會把自動出借永久停在停用狀態。設成 false 讓新的觸發排隊，接在前一輪後面跑，
-  # 剛好也讓覆蓋時間可以連續銜接。
-  cancel-in-progress: false
-
 env:
-  # LOOP_COUNT × LOOP_INTERVAL = 覆蓋時間（預設 6 × 600s = 50 分鐘）。
-  # public repo 的 Actions 分鐘數免費，想要更接近全天候覆蓋可以把 LOOP_COUNT 調大，
-  # 但記得同步調高下面的 timeout-minutes（GitHub 單一 job 上限 6 小時）。
-  LOOP_COUNT: '6'
-  LOOP_INTERVAL: '600'
   BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
   BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -38,9 +21,7 @@ jobs:
     # 這個名字必須跟 repo 的 Environments 名稱一樣
     environment: aa85192
     runs-on: ubuntu-latest
-    # 要容納 LOOP_COUNT × LOOP_INTERVAL 的迴圈，並留餘裕讓迴圈自己跑完，
-    # 而不是被 timeout 砍在 Bitfinex 寫入的半路上
-    timeout-minutes: 70
+    timeout-minutes: 5
     steps:
       - name: Dump GitHub Context
         run: |
@@ -136,16 +117,4 @@ jobs:
           set -ex
           yarn > /dev/null 2>&1
           yarn lint
-          ok=0
-          fail=0
-          for i in $(seq 1 "$LOOP_COUNT"); do
-            if [ "$i" -gt 1 ]; then sleep "$LOOP_INTERVAL"; fi
-            # 只有最後一輪才發 Telegram，否則同一次觸發會重複通知 LOOP_COUNT 次
-            if [ "$i" -eq "$LOOP_COUNT" ]; then export INPUT_NOTIFY=1; else export INPUT_NOTIFY=0; fi
-            echo "::group::iteration $i/$LOOP_COUNT"
-            if yarn tsx ./bin/funding-auto-renew-3.ts; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
-            echo "::endgroup::"
-          done
-          echo "iterations: ok=$ok fail=$fail"
-          # 單一輪失敗（例如撞到 nonce）不該讓整段覆蓋時間報廢，只有全部失敗才紅燈
-          [ "$ok" -gt 0 ]
+          yarn tsx ./bin/funding-auto-renew-3.ts
