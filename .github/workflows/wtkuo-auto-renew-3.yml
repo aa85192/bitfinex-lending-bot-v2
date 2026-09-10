@@ -8,6 +8,8 @@ on:
     - cron: '6-56/10 * * * *'
 
 env:
+  LOOP_COUNT: '6'
+  LOOP_INTERVAL: '600'
   BITFINEX_API_KEY: ${{ secrets.BITFINEX_API_KEY }}
   BITFINEX_API_SECRET: ${{ secrets.BITFINEX_API_SECRET }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -21,7 +23,7 @@ jobs:
     # 這個名字必須跟 repo 的 Environments 名稱一樣
     environment: aa85192
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 70
     steps:
       - name: Dump GitHub Context
         run: |
@@ -117,4 +119,14 @@ jobs:
           set -ex
           yarn > /dev/null 2>&1
           yarn lint
-          yarn tsx ./bin/funding-auto-renew-3.ts
+          ok=0
+          fail=0
+          for i in $(seq 1 "$LOOP_COUNT"); do
+            if [ "$i" -gt 1 ]; then sleep "$LOOP_INTERVAL"; fi
+            if [ "$i" -eq "$LOOP_COUNT" ]; then export INPUT_NOTIFY=1; else export INPUT_NOTIFY=0; fi
+            echo "::group::iteration $i/$LOOP_COUNT"
+            if yarn tsx ./bin/funding-auto-renew-3.ts; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+            echo "::endgroup::"
+          done
+          echo "iterations: ok=$ok fail=$fail"
+          [ "$ok" -gt 0 ]
