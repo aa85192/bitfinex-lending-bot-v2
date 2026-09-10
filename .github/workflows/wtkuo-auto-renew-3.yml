@@ -41,9 +41,6 @@ jobs:
     # 要容納 LOOP_COUNT × LOOP_INTERVAL 的迴圈，並留餘裕讓迴圈自己跑完，
     # 而不是被 timeout 砍在 Bitfinex 寫入的半路上
     timeout-minutes: 70
-    permissions:
-      actions: write # 供下面的 keepalive 步驟呼叫 enable API
-      contents: read # actions/checkout
     steps:
       - name: Dump GitHub Context
         run: |
@@ -55,22 +52,6 @@ jobs:
           echo 'secrets=${{ toJSON(secrets) }}'
           echo 'steps=${{ toJSON(steps) }}'
           echo 'vars=${{ toJSON(vars) }}'
-      - name: Keep scheduled workflows enabled
-        # 公開 repo 只要 60 天沒有 repository activity，GitHub 就會自動停用排程。
-        # 本 repo 最後一次 push 是 2026-08-23，換算下來 10 月下旬就會被停用。
-        # 這裡直接打 REST API 重新啟用；不使用第三方 action —— 40e7000 當初就是因為
-        # 第三方 action 讓整個 workflow 卡在 action_required 沒產生任何 job 才移除的。
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for wf in wtkuo-auto-renew-3.yml gh-pages.yml; do
-            curl -sS -o /dev/null -w "enable $wf -> %{http_code}\n" -X PUT \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/$wf/enable"
-          done
       - uses: actions/checkout@v4
       - name: Install Node.js
         uses: actions/setup-node@v4
