@@ -83,8 +83,8 @@ jobs:
             UST:
               amount: 0
               rank: 0.5
-              rateMax: 0.001
-              rateMin: 0.0001918
+              rateMax: 0.01
+              rateMin: 0.0001
               period:
                 3: 0.00027397
                 4: 0.00030822

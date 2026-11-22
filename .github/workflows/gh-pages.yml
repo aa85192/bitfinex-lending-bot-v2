@@ -35,8 +35,8 @@ jobs:
       - name: Export current status (USD + UST)
         run: INPUT_CURRENCYS=USD,UST yarn tsx ./bin/export-current-status.ts
 
-      - name: Generate funding statistics (USD)
-        run: INPUT_CURRENCYS=USD yarn tsx ./bin/funding-statistics-1.ts
+      - name: Generate funding statistics (USD + UST)
+        run: INPUT_CURRENCYS=USD,UST yarn tsx ./bin/funding-statistics-1.ts
 
       - name: Setup Node.js for webapp (npm)
         uses: actions/setup-node@v4
