@@ -71,6 +71,14 @@ export async function main (): Promise<void> {
     payments = _.sortBy(payments, ['mts'])
     // ymlDump('payments', payments)
 
+    // 尚無任何利息紀錄（例如 UST 還沒開始放貸）：輸出空資料讓網頁正常顯示，不發報告
+    if (payments.length === 0) {
+      loggers.log(`[${currency}] no interest payments yet, writing empty statistics`)
+      await writeFile(new URL(`${currency}.json`, outdir), '[]')
+      await writeFile(new URL(`${currency}.csv`, outdir), '')
+      continue
+    }
+
     const stats: Record<string, any> = {}
     let [dateMax, dateMin]: any[] = [null, null]
     const tplStat = date => ({ date, interest: 0, balance: null, investment: null, utilization: 0, dpr: 0, apr1: 0, apr7: 0, apr30: 0, apr365: 0 })
